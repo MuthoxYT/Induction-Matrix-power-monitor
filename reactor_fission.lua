@@ -18,7 +18,9 @@ local CONFIG = {
     defaultCeiling = 10,        -- approved water/turbine limit; NOT structural max
     stopPercent = 95, resumePercent = 80,
     tripTemperature = 1000, resetTemperature = 600, -- Kelvin
-    tripWater = 0.25, resetWater = 0.80,
+    tripWater = 0.50, resetWater = 0.95,
+    throttleWater = 0.90, coolingStepSeconds = 1,
+    coolingReduction = 0.20, coolingRecoverySeconds = 10,
     tripSteam = 0.80, resetSteam = 0.20,
     tripWaste = 0.80, resetWaste = 0.50,
     startRate = 0.1, rampStep = 0.1, rampSeconds = 2,
@@ -100,6 +102,8 @@ function M.create(context)
     local stopError, persistenceError, expectedActive, initialized = nil, nil, false, false
     local lastRamp, resetRequested = 0, false
     local resumeRate, resumeRequested = nil, false -- memory only, normal manual pause
+    -- Learned supply limit is memory only and survives normal PAUSE/STANDBY.
+    local coolingLimit, previousWater, previousWaterAt, lastCoolingReduction, recoverySince
     local function persist()
         local ok, err = protected(writeState, {version = 1, ceiling = ceiling, latch = latch})
         if not ok then
@@ -149,6 +153,7 @@ function M.create(context)
     end
     local function trip(message)
         resumeRate, resumeRequested = nil, false
+        previousWater, previousWaterAt, recoverySince = nil, nil, nil
         mode, reason = "FAULT", tostring(message)
         if not latch then latch = reason; persist() end
         if persistenceError then reason = persistenceError end
@@ -188,6 +193,35 @@ function M.create(context)
         end
         return r
     end
+    local function cooling(r, t)
+        -- Use fresh raw pairs: averaging must not hide an approaching dry tank.
+        local continuous = previousWaterAt and t > previousWaterAt
+            and t - previousWaterAt <= CONFIG.maxAgeSeconds
+        local falling = continuous and r.water < previousWater - 0.000001
+        previousWater, previousWaterAt = r.water, t
+        if not r.active then recoverySince = nil; return false end
+        if r.water < CONFIG.throttleWater and (falling or not continuous)
+            and (not lastCoolingReduction or t - lastCoolingReduction >= CONFIG.coolingStepSeconds) then
+            local reduced = math.max(CONFIG.startRate,
+                math.floor(math.min(r.rate * (1 - CONFIG.coolingReduction),
+                    r.rate - CONFIG.rampStep) * 100 + 0.000001) / 100)
+            coolingLimit = math.min(coolingLimit or math.huge, reduced)
+            lastCoolingReduction = t
+        end
+        -- A cap learned under load only grows after ten continuous seconds of
+        -- recovered water at that cap. Each probe adds at most 0.1 mB/t.
+        if not continuous or falling or r.water < CONFIG.resetWater then recoverySince = nil end
+        if r.water >= CONFIG.resetWater and not falling and continuous then
+            if coolingLimit and r.rate >= math.min(coolingLimit, ceiling, r.max) - 0.001 then
+                recoverySince = recoverySince or t
+                if t - recoverySince >= CONFIG.coolingRecoverySeconds then
+                    coolingLimit = math.min(ceiling, r.max, coolingLimit + CONFIG.rampStep)
+                    recoverySince = t
+                end
+            else recoverySince = nil end
+        end
+        return falling
+    end
     local self = {}
     function self.update(matrix, now)
         if interrupted then trip("Programmabbruch: Terminated"); return end
@@ -211,7 +245,7 @@ function M.create(context)
             local t = freshness(matrix, started)
             readings, matrixPercent, sampledAt = r, matrix.percent, t
             if r.temperature >= CONFIG.tripTemperature then error("Temperatur zu hoch", 0) end
-            if r.water <= CONFIG.tripWater then error("Zu wenig Wasser", 0) end
+            if r.water <= CONFIG.tripWater then error("Wasserreserve <=50% - Kuehlung pruefen", 0) end
             if r.steam >= CONFIG.tripSteam then error("Dampfstau / Turbine pruefen", 0) end
             if r.waste >= CONFIG.tripWaste then error("Abfalltank zu voll", 0) end
             if r.damage > 0 then error("Reaktorschaden gemeldet", 0) end
@@ -228,6 +262,7 @@ function M.create(context)
                 else notice = "RESET gesperrt: kalt, sicher und gestoppt erforderlich" end
             end
             if mode == "FAULT" or latch then stop(); return end
+            local waterFalling = cooling(r, t)
             local resuming = mode == "PAUSE" and resumeRequested and resumeRate ~= nil
             if mode == "PAUSE" and resumeRate and r.active then
                 error("Unerwarteter Start waehrend manueller Pause",0)
@@ -256,10 +291,10 @@ function M.create(context)
                 if r.active then error("Externer Start im Standby", 0) end
                 return
             end
-            local limit = math.min(ceiling, r.max)
+            local limit = math.min(ceiling, r.max, coolingLimit or math.huge)
             if not r.active then
                 if not healthyForStart(r, true) then
-                    notice = "Start wartet: <=600K, Wasser>=80%, Dampf<=20%, Abfall<=50%"
+                    notice = "Start wartet: <=600K, Wasser>=95%, Dampf<=20%, Abfall<=50%"
                     return
                 end
                 if not persist() then error(persistenceError,0) end
@@ -274,7 +309,7 @@ function M.create(context)
                 if startRate > liveCap then error("Strukturmaximum waehrend Start geaendert", 0) end
                 command("activate")
                 if device.getStatus() ~= true then error("Start nicht bestaetigt", 0) end
-                r.active = true
+                r.active, r.rate = true, startRate
                 expectedActive, lastRamp = true, clock()
                 resumeRate, resumeRequested = nil, false
                 mode, reason = "AUTO", "Regelt nach Matrix-Fuellstand"
@@ -282,7 +317,10 @@ function M.create(context)
             end
             if not expectedActive then error("Unerwartet aktiver Reaktor", 0) end
             local fraction = math.max(0, math.min(1, (CONFIG.stopPercent - matrix.percent) / CONFIG.stopPercent))
-            local target = math.min(limit, math.max(CONFIG.startRate, limit * fraction * fraction))
+            local batteryTarget = math.max(CONFIG.startRate, math.min(ceiling, r.max) * fraction * fraction)
+            local target = math.min(limit, batteryTarget)
+            -- Recovery cannot race the normal battery ramp or a saved resume rate.
+            if waterFalling or r.water < CONFIG.resetWater then target = math.min(target, r.rate) end
             local nextRate = r.rate
             if nextRate > target then nextRate = target
             elseif t - lastRamp >= CONFIG.rampSeconds then nextRate = math.min(target, nextRate + CONFIG.rampStep) end
@@ -291,9 +329,15 @@ function M.create(context)
                 freshness(matrix, started)
                 nextRate = math.min(nextRate, ceiling, liveCap)
                 command("setBurnRate", nextRate)
+                r.rate = nextRate
                 lastRamp = clock()
             end
             mode, reason = "AUTO", "Regelt nach Matrix-Fuellstand"
+            if coolingLimit then
+                reason = string.format("Wasser begrenzt: %.2f mB/t", math.min(coolingLimit, ceiling, r.max))
+            elseif waterFalling or r.water < CONFIG.resetWater then
+                reason = "Wasser erholt sich - Leistung halten"
+            end
         end)
         if not success then resetRequested = false; trip(err) end
     end
@@ -348,7 +392,8 @@ function M.create(context)
         local editable = mode == "PAUSE" and not latch and not persistenceError and readings ~= nil
         local resumable = mode == "PAUSE" and resumeRate ~= nil and not latch and not persistenceError
         return {mode = mode, reason = reason, notice = notice, stopError = stopError,
-            ceiling = ceiling, name = deviceName, readings = readings, matrixPercent = matrixPercent,
+            ceiling = ceiling, coolingCeiling = coolingLimit,
+            name = deviceName, readings = readings, matrixPercent = matrixPercent,
             actions = {
                 {id="auto",label="AUTO",enabled=mode=="PAUSE" and not resumeRate and not latch and not persistenceError},
                 {id=resumable and "resume" or "pause",label=resumable and "WEITER" or "PAUSE",enabled=true},
