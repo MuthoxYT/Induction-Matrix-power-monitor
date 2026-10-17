@@ -178,25 +178,39 @@ function M.create(context)
         if not number(t, 0, math.huge - 1) or t < started or t - started > CONFIG.maxAgeSeconds
             or not matrix or not number(matrix.sampledAt, 0, t)
             or t - matrix.sampledAt > CONFIG.maxAgeSeconds then
-            error("Messwerte veraltet / Abfrage zu langsam", 0)
+            local matrixAge = matrix and number(matrix.sampledAt, 0, t) and t-matrix.sampledAt
+            local reactorAge = number(t, started, math.huge-1) and t-started
+            error("Messwerte veraltet: Matrix " .. (matrixAge and string.format("%.2fs",matrixAge) or "ungueltig")
+                .. " / Reaktor " .. (reactorAge and string.format("%.2fs",reactorAge) or "ungueltig"), 0)
         end
         return t
     end
     local function read()
         local r = {}
-        r.active = device.getStatus()
-        r.forced = device.isForceDisabled()
+        local coolant
+        -- These calls only read state. Submit them together so each yielding
+        -- main-thread read need not wait for the previous server tick. The
+        -- owner waits for ALL of them before validation or any write command.
+        local tasks = {
+            function() r.active = device.getStatus() end,
+            function() r.forced = device.isForceDisabled() end,
+            function() r.rate = requireNumber(device.getBurnRate(), 0, 1000000, "Brennrate") end,
+            function() r.actual = requireNumber(device.getActualBurnRate(), 0, 1000000, "Ist-Brennrate") end,
+            function() r.max = requireNumber(device.getMaxBurnRate(), 0.1, 1000000, "Strukturmaximum") end,
+            function() r.temperature = requireNumber(device.getTemperature(), 0, 1000000, "Temperatur") end,
+            function() r.water = requireNumber(device.getCoolantFilledPercentage(), 0, 1, "Wasser") end,
+            function() r.steam = requireNumber(device.getHeatedCoolantFilledPercentage(), 0, 1, "Dampf") end,
+            function() r.waste = requireNumber(device.getWasteFilledPercentage(), 0, 1, "Abfall") end,
+            function() r.fuel = requireNumber(device.getFuelFilledPercentage(), 0, 1, "Brennstoff") end,
+            function() r.damage = requireNumber(device.getDamagePercent(), 0, 100, "Schaden") end,
+            function() coolant = device.getCoolant() end,
+        }
+        if parallel and type(parallel.waitForAll)=="function" then
+            parallel.waitForAll(table.unpack(tasks))
+        else
+            for _, task in ipairs(tasks) do task() end
+        end
         if type(r.active) ~= "boolean" or type(r.forced) ~= "boolean" then error("Status ungueltig", 0) end
-        r.rate = requireNumber(device.getBurnRate(), 0, 1000000, "Brennrate")
-        r.actual = requireNumber(device.getActualBurnRate(), 0, 1000000, "Ist-Brennrate")
-        r.max = requireNumber(device.getMaxBurnRate(), 0.1, 1000000, "Strukturmaximum")
-        r.temperature = requireNumber(device.getTemperature(), 0, 1000000, "Temperatur")
-        r.water = requireNumber(device.getCoolantFilledPercentage(), 0, 1, "Wasser")
-        r.steam = requireNumber(device.getHeatedCoolantFilledPercentage(), 0, 1, "Dampf")
-        r.waste = requireNumber(device.getWasteFilledPercentage(), 0, 1, "Abfall")
-        r.fuel = requireNumber(device.getFuelFilledPercentage(), 0, 1, "Brennstoff")
-        r.damage = requireNumber(device.getDamagePercent(), 0, 100, "Schaden")
-        local coolant = device.getCoolant()
         if type(coolant) ~= "table" or coolant.name ~= "minecraft:water" then
             error("Nur WASSER unterstuetzt - Kuehlmittel pruefen", 0)
         end
