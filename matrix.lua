@@ -11,6 +11,8 @@ local CONFIG = {
     smoothingSeconds = 5,   -- rolling observation window for trend and ETA
     textScale = nil,        -- nil = automatic; otherwise 0.5, 1, 1.5, ... 5
     reactorModule = "reactor_fission.lua", -- relative to THIS script; nil disables
+    remoteModule = "matrix_remote.lua", -- optional Pocket transport, same folder
+    remoteClients = {3},     -- allowed Pocket computer IDs
 }
 
 local C = colors
@@ -21,6 +23,7 @@ local factor, unit = 1, "J"
 local paletteApplied = false
 local reactor, addonError, addonPresent, page, hits = nil, nil, false, "matrix", {}
 local cachedMatrix, cachedError, cachedReactor
+local remote
 local monitorGeneration = 0
 local terminating = false
 local function protected(fn, ...)
@@ -610,6 +613,15 @@ local function poll()
     if cachedMatrix then
         log("Matrix verbunden: " .. data.name .. ". Anzeige in " .. unit .. ". Stoppen: Ctrl+T.")
     end
+    -- Network discovery and publication belong to the serial owner, AFTER
+    -- reactor protection. They reuse the completed observation only.
+    if remote then
+        protected(remote.open)
+        if terminating then return end
+        protected(remote.publish, {matrix=cachedMatrix,error=cachedError,
+            reactor=cachedReactor,addonError=addonError,unit=unit,factor=factor})
+        if terminating then return end
+    end
     safeDraw()
 end
 
@@ -646,7 +658,34 @@ if CONFIG.reactorModule and fs and shell and shell.getRunningProgram then
     end
 end
 
+-- Transport is optional: a missing/corrupt file or absent rednet API must not
+-- affect local measurement, controls or protection. create() does no I/O;
+-- wireless discovery first happens after poll() has updated reactor safety.
+if CONFIG.remoteModule then
+    local loaded, result = protected(function()
+        if not (fs and shell and shell.getRunningProgram) then return end
+        local path = fs.combine(fs.getDir(shell.getRunningProgram()), CONFIG.remoteModule)
+        if not fs.exists(path) then return end
+        local chunk, err = loadfile(path)
+        if not chunk then error(err,0) end
+        local module = chunk()
+        assert(type(module)=="table" and type(module.create)=="function", "Remote-Vertrag ungueltig")
+        local instance = module.create({clock=now,allowedClients=CONFIG.remoteClients,
+            onTerminate=function() terminating=true end})
+        for _,method in ipairs({"open","publish","capture","process"}) do
+            assert(type(instance)=="table" and type(instance[method])=="function",
+                "Remote-Methode fehlt: "..method)
+        end
+        return instance
+    end)
+    if loaded then remote = result else log("Pocket-Verbindung nicht verfuegbar: "..tostring(result)) end
+end
+
 print("Induction Matrix Monitor - Monitor links / Matrix per Wired Modem")
+if type(os.getComputerID)=="function" then
+    local identified, id = protected(os.getComputerID)
+    if identified then print("Computer-ID (Pocket-Ziel): "..tostring(id)) end
+end
 if unit == "J" and CONFIG.displayUnit == "FE" then
     print("FE-Helfer nicht verfuegbar: korrekte Rohwerte in Joule (J).")
 end
@@ -717,6 +756,11 @@ local function captureEvents()
                     break
                 end
             end
+        elseif event == "rednet_message" and remote then
+            -- Pure validation only: no discovery, sends or device operations
+            -- while the owner may be suspended inside a peripheral read.
+            local captured, command = protected(remote.capture,name,x,y)
+            if captured and command then enqueue({remote=command}) end
         elseif event == "timer" and name == timer then
             pollRequested = true
             wake()
@@ -749,6 +793,24 @@ local function controlOwner()
             if command.page then
                 page, previousRows = command.page, nil
                 safeDraw()
+            elseif command.remote and remote then
+                -- A click can arrive between polls or during a yielding read.
+                -- Refresh protection before the transport checks current state.
+                safePoll()
+                if terminating then return end
+                protected(remote.process,command.remote,function(action)
+                    if terminating or not reactor then return false,"Steuerung nicht verfuegbar" end
+                    local acted, err = protected(reactor.action,action)
+                    if not acted then
+                        addonError=tostring(err)
+                        protected(reactor.shutdown,addonError)
+                    end
+                    -- Apply intent through the same fresh-data owner path.
+                    safePoll()
+                    if terminating then return false,"Terminated" end
+                    if not acted or addonError then return false,addonError or tostring(err) end
+                    return true
+                end)
             elseif command.action and reactor then
                 local acted, err = protected(reactor.action,command.action)
                 if not acted then addonError=tostring(err); protected(reactor.shutdown,addonError) end
