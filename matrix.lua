@@ -593,6 +593,7 @@ local function safeDraw()
     end
 end
 
+local safetyGeneration = 0
 local function poll()
     -- Only the serial owner calls this, even while capture receives events.
     local ok, data = protected(measure)
@@ -610,6 +611,9 @@ local function poll()
         if viewed then cachedReactor = v else addonError = tostring(v) end
     end
     if terminating then return end
+    -- Mark the completed safety observation BEFORE network/drawing can yield.
+    -- Capture only reads this scalar; it never calls a peripheral or addon.
+    safetyGeneration = safetyGeneration + 1
     if cachedMatrix then
         log("Matrix verbunden: " .. data.name .. ". Anzeige in " .. unit .. ". Stoppen: Ctrl+T.")
     end
@@ -760,7 +764,7 @@ local function captureEvents()
             -- Pure validation only: no discovery, sends or device operations
             -- while the owner may be suspended inside a peripheral read.
             local captured, command = protected(remote.capture,name,x,y)
-            if captured and command then enqueue({remote=command}) end
+            if captured and command then enqueue({remote=command,safetyGeneration=safetyGeneration}) end
         elseif event == "timer" and name == timer then
             pollRequested = true
             wake()
@@ -794,9 +798,10 @@ local function controlOwner()
                 page, previousRows = command.page, nil
                 safeDraw()
             elseif command.remote and remote then
-                -- A click can arrive between polls or during a yielding read.
-                -- Refresh protection before the transport checks current state.
-                safePoll()
+                -- Reuse a deadline/in-flight poll only when its safety check
+                -- completed after capture. A click during later publication or
+                -- drawing still requires a new check before execution.
+                if safetyGeneration <= command.safetyGeneration then safePoll() end
                 if terminating then return end
                 protected(remote.process,command.remote,function(action)
                     if terminating or not reactor then return false,"Steuerung nicht verfuegbar" end
