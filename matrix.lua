@@ -20,6 +20,8 @@ local lastLog, timer
 local factor, unit = 1, "J"
 local paletteApplied = false
 local reactor, addonError, addonPresent, page, hits = nil, nil, false, "matrix", {}
+local cachedMatrix, cachedError, cachedReactor
+local monitorGeneration = 0
 local terminating = false
 local function protected(fn, ...)
     local ok, value, b, c = pcall(fn, ...)
@@ -421,10 +423,10 @@ local function display(frame, width, height)
     previousRows, previousWidth, previousHeight = frame.rows, width, height
 end
 
-local function navigation(f, width)
+local function navigation(f, width, targets)
     if not addonPresent then return end
     local split = math.floor(width / 2)
-    local state = reactor and reactor.getView() or nil
+    local state = cachedReactor
     local reactorLabel = state and state.mode == "FAULT" and "REAKTOR ! FAULT" or "REAKTOR > CONTROL"
     for i, tab in ipairs({{"matrix", "MATRIX"}, {"reactor", reactorLabel}}) do
         local x, span = i == 1 and 1 or split + 1, i == 1 and split or width - split
@@ -433,15 +435,16 @@ local function navigation(f, width)
         local fg = i==2 and (addonError or (state and state.mode=="FAULT")) and C.red
             or (page == tab[1] and C.cyan or C.lightGray)
         f.center(1, tab[2], fg, bg, x, span)
-        hits[#hits + 1] = {x=x,y=1,w=span,h=1,page=tab[1]}
+        targets[#targets + 1] = {x=x,y=1,w=span,h=1,page=tab[1]}
     end
 end
 
-local function renderReactor(width, height)
+local function renderReactor(width, height, targets)
     if addonError or not reactor then
         return renderMessage("Addon: " .. tostring(addonError or "nicht geladen"), width, height, "REAKTOR FEHLER")
     end
-    local v, f = reactor.getView(), newFrame(width, height)
+    local v, f = cachedReactor, newFrame(width, height)
+    if not v then return renderMessage("Reaktormessung laeuft...",width,height,"REAKTOR") end
     local spacious = width >= 38 and height >= 22
     local color = v.mode == "FAULT" and C.red or (v.mode == "AUTO" and C.lime or C.orange)
     local firstControlY = height - (spacious and 5 or 3)
@@ -505,7 +508,7 @@ local function renderReactor(width, height)
             local bg = a.id=="scram" and C.red or (a.enabled and C.blue or C.gray)
             f.rect(x,y,w,rowHeight,bg)
             f.center(y,a.label,a.id=="scram" and C.black or (a.enabled and C.white or C.lightGray),bg,x,w)
-            if a.enabled then hits[#hits+1]={x=x,y=y,w=w,h=rowHeight,action=a.id} end
+            if a.enabled then targets[#targets+1]={x=x,y=y,w=w,h=rowHeight,action=a.id} end
         end
     else
         line(height,"Monitor vergroessern",C.orange)
@@ -540,38 +543,74 @@ local function connectMonitor()
     return true
 end
 
-local function refresh()
-    hits = {}
-    -- Protection precedes every monitor operation, including reconnect and draw.
-    local ok, data = protected(measure)
-    if terminating then return end
-    if not ok then history = {}; log(tostring(data)) end
-    if reactor then
-        local updated, err = protected(reactor.update, ok and data or nil, now())
-        if not updated then
-            addonError = "Steuerung fehlgeschlagen: " .. tostring(err)
-            protected(reactor.shutdown, addonError)
-        end
-    end
-    if terminating then return end
+-- Draw only the last completed observation. Changing pages never performs a
+-- telemetry/control cycle. New hit targets become visible atomically after
+-- the whole draw succeeds; the old targets stay usable during yielding reads.
+local function drawCached()
+    -- Capture before ANY monitor call: connect/size/blit may all yield while
+    -- captureEvents invalidates the geometry or replaces the monitor lifetime.
+    local generation = monitorGeneration
     local okMonitor, ready = protected(connectMonitor)
     if terminating then return end
+    if generation ~= monitorGeneration then
+        hits, previousRows = {}, nil
+        return -- the queued geometry event requests a fresh complete draw
+    end
     if not okMonitor or not ready then
+        hits = {}
         if not okMonitor then log("Monitor nicht erreichbar: " .. tostring(ready)) end
         return
     end
     local width, height = monitor.getSize()
-    local frame
+    local frame, targets = nil, {}
     if page == "reactor" and addonPresent then
-        frame = renderReactor(width,height)
-    elseif ok then
-        frame = renderData(data,width,height)
-        log("Matrix verbunden: " .. data.name .. ". Anzeige in " .. unit .. ". Stoppen: Ctrl+T.")
+        frame = renderReactor(width,height,targets)
+    elseif cachedMatrix then
+        frame = renderData(cachedMatrix,width,height)
     else
-        frame = renderMessage(tostring(data), width, height)
+        frame = renderMessage(cachedError or "Messung laeuft...", width, height)
     end
-    navigation(frame,width)
+    navigation(frame,width,targets)
     display(frame,width,height)
+    if generation == monitorGeneration then
+        hits = targets
+    else
+        -- A completed old draw must never resurrect invalidated targets or
+        -- cache rows from a screen that was cleared/reconnected while yielding.
+        hits, previousRows = {}, nil
+    end
+end
+
+local function safeDraw()
+    if terminating then return end
+    local ok, err = protected(drawCached)
+    if not ok and not terminating then
+        hits, previousRows = {}, nil
+        log("Anzeige nicht erreichbar; erneuter Versuch: " .. tostring(err))
+    end
+end
+
+local function poll()
+    -- Only the serial owner calls this, even while capture receives events.
+    local ok, data = protected(measure)
+    if terminating then return end
+    cachedMatrix, cachedError = ok and data or nil, not ok and tostring(data) or nil
+    if not ok then history = {}; log(tostring(data)) end
+    if reactor then
+        local updated, err = protected(reactor.update, cachedMatrix, now())
+        if not updated then
+            addonError = "Steuerung fehlgeschlagen: " .. tostring(err)
+            protected(reactor.shutdown, addonError)
+        end
+        if terminating then return end
+        local viewed, v = protected(reactor.getView)
+        if viewed then cachedReactor = v else addonError = tostring(v) end
+    end
+    if terminating then return end
+    if cachedMatrix then
+        log("Matrix verbunden: " .. data.name .. ". Anzeige in " .. unit .. ". Stoppen: Ctrl+T.")
+    end
+    safeDraw()
 end
 
 local args = {...}
@@ -612,19 +651,18 @@ if unit == "J" and CONFIG.displayUnit == "FE" then
     print("FE-Helfer nicht verfuegbar: korrekte Rohwerte in Joule (J).")
 end
 
-local function safeRefresh()
+local nextPoll = 0
+local function safePoll()
     if terminating then return end
-    local ok, err = protected(refresh)
+    -- Old timers may arrive during main-thread waits. Cancel before polling,
+    -- then schedule exactly one future check after all yielding work finishes.
+    if timer then os.cancelTimer(timer); timer = nil end
+    local ok, err = protected(poll)
     if terminating then return end
     if not ok then
-        hits = {}
-        previousRows, history = nil, {}
-        log("Anzeige nicht erreichbar; erneuter Versuch: " .. tostring(err))
+        log("Messung nicht erreichbar; erneuter Versuch: " .. tostring(err))
     end
-    -- Peripheral methods yield and may consume a pending timer while waiting
-    -- for task_complete. Every refresh path must schedule its NEXT check only
-    -- after all yielding work, including touch/resize/reconnect/error paths.
-    if timer then os.cancelTimer(timer) end
+    nextPoll = now() + CONFIG.refreshSeconds
     timer = os.startTimer(CONFIG.refreshSeconds)
 end
 
@@ -650,37 +688,91 @@ local function finalStop()
         if reactor then print(stopNote) end
 end
 
-safeRefresh()
-while not terminating do
-    local event, name, x, y = os.pullEventRaw()
-    if event == "terminate" then
-        terminating = true
-    elseif event == "char" and addonPresent and (name == "m" or name == "r") then
-        page = name == "m" and "matrix" or "reactor"
-        previousRows = nil
-        safeRefresh()
-    elseif event == "monitor_touch" and name == CONFIG.monitor then
-        for _,hit in ipairs(hits) do
-            if x>=hit.x and x<hit.x+hit.w and y>=hit.y and y<hit.y+hit.h then
-                if hit.page then page=hit.page
-                elseif hit.action and reactor then
-                    local acted, err = protected(reactor.action,hit.action)
-                    if not acted then addonError=tostring(err); protected(reactor.shutdown,addonError) end
+local queue, head, tail = {}, 1, 0
+local wakeEvent = "matrix_control_wake"
+local pollRequested = true
+local function wake() os.queueEvent(wakeEvent) end
+local function enqueue(command)
+    tail = tail + 1
+    queue[tail] = command
+    wake()
+end
+
+-- This coroutine never calls a peripheral or an addon method. Classic parallel
+-- broadcasts every event to it, regardless of the owner's task_complete filter.
+local function captureEvents()
+    while true do
+        local event, name, x, y = os.pullEventRaw()
+        if event == "terminate" then
+            terminating = true
+            wake()
+        elseif event == "char" and addonPresent and (name == "m" or name == "r") then
+            enqueue({page=name == "m" and "matrix" or "reactor"})
+        elseif event == "monitor_touch" and name == CONFIG.monitor then
+            for _,hit in ipairs(hits) do
+                if x>=hit.x and x<hit.x+hit.w and y>=hit.y and y<hit.y+hit.h then
+                    -- Resolve NOW against the completed visible frame. Never
+                    -- reinterpret queued coordinates on a different page.
+                    enqueue({page=hit.page,action=hit.action})
+                    break
                 end
-                previousRows=nil
-                safeRefresh()
-                break
             end
+        elseif event == "timer" and name == timer then
+            pollRequested = true
+            wake()
+        elseif event == "monitor_resize" and name == CONFIG.monitor then
+            monitorGeneration = monitorGeneration + 1
+            hits, previousRows = {}, nil
+            enqueue({redraw=true})
+        elseif event == "peripheral" or event == "peripheral_detach" then
+            if name == CONFIG.monitor then
+                monitorGeneration = monitorGeneration + 1
+                hits, previousRows = {}, nil
+            end
+            enqueue({peripheral=name})
         end
-    elseif event == "timer" and name == timer then
-        safeRefresh()
-    elseif event == "monitor_resize" and name == CONFIG.monitor then
-        previousRows = nil
-        safeRefresh()
-    elseif event == "peripheral" or event == "peripheral_detach" then
-        previousRows = nil
-        if name == CONFIG.monitor then paletteApplied = false end
-        safeRefresh()
     end
 end
+
+local function controlOwner()
+    while not terminating do
+        -- Deadline first, including between queued commands: UI traffic cannot
+        -- perpetually defer protection, even if the timer wake was filtered out.
+        if pollRequested or now() >= nextPoll then
+            pollRequested = false
+            safePoll()
+        end
+        if terminating then return end
+        if head <= tail then
+            local command = queue[head]
+            queue[head], head = nil, head + 1
+            if command.page then
+                page, previousRows = command.page, nil
+                safeDraw()
+            elseif command.action and reactor then
+                local acted, err = protected(reactor.action,command.action)
+                if not acted then addonError=tostring(err); protected(reactor.shutdown,addonError) end
+                -- Actions may arm AUTO or change limits; apply through the same
+                -- serialized fresh-data path, never a concurrent command worker.
+                safePoll()
+            elseif command.peripheral then
+                previousRows = nil
+                if command.peripheral == CONFIG.monitor then paletteApplied = false end
+                pollRequested = true
+            elseif command.redraw then
+                previousRows = nil
+                safeDraw()
+            end
+        else
+            queue, head, tail = {}, 1, 0
+            -- The persistent queue is always checked before waiting. A wake
+            -- consumed during a peripheral call cannot lose its command.
+            os.pullEventRaw(wakeEvent)
+        end
+    end
+end
+
+local ran, runError = protected(parallel.waitForAny,captureEvents,controlOwner)
+if not ran and not terminating then log("Eventschleife fehlgeschlagen: " .. tostring(runError)) end
+terminating = true
 finalStop()
