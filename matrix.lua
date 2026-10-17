@@ -8,7 +8,7 @@ local CONFIG = {
     matrixName = nil,       -- nil = detect; or e.g. "inductionPort_0"
     displayUnit = "FE",     -- "FE" or "J"; automatic safe fallback to J
     refreshSeconds = 0.5,
-    smoothingSeconds = 10,  -- rolling observation window for trend and ETA
+    smoothingSeconds = 5,   -- rolling observation window for trend and ETA
     textScale = nil,        -- nil = automatic; otherwise 0.5, 1, 1.5, ... 5
 }
 
@@ -17,6 +17,15 @@ local monitor, matrixName, history = nil, nil, {}
 local previousRows, previousWidth, previousHeight
 local lastLog, timer
 local factor, unit = 1, "J"
+local paletteApplied = false
+
+-- A monitor-local palette keeps panels distinct without harsh default colors.
+local THEME = {
+    [C.black] = 0x080D14, [C.gray] = 0x142130, [C.blue] = 0x1B3046,
+    [C.white] = 0xE9F1F6, [C.lightGray] = 0x91A6B9, [C.cyan] = 0x58D1DC,
+    [C.green] = 0x35B78C, [C.lime] = 0x7DE2BB,
+    [C.orange] = 0xEFB366, [C.red] = 0xED7483,
+}
 
 -- Mekanism's native computer methods return Joules, independently of GUI units.
 -- Derive conversion from the mod's helper instead of assuming a server ratio.
@@ -133,22 +142,42 @@ local function measure()
     end
     matrixName = name
 
-    -- Discard the old trend immediately when the measured direction reverses.
-    if last and #history >= 2 then
-        local oldChange = last.energy - history[1].energy
-        local newChange = energy - last.energy
-        if oldChange * newChange < 0 then history = {last} end
-    end
     if not last or t > last.t then
-        history[#history + 1] = {t = t, energy = energy, cap = cap}
+        history[#history + 1] = {t = t, energy = energy, cap = cap, input = input, output = output}
     end
-    -- Keep the observation immediately before the window boundary, if present.
-    while #history > 2 and history[2].t <= t - CONFIG.smoothingSeconds do
+    local boundary = t - CONFIG.smoothingSeconds
+    -- Keep the two samples surrounding the exact window boundary.
+    while #history > 2 and history[2].t <= boundary do
         table.remove(history, 1)
     end
     local first = history[1]
-    local elapsed = t - first.t
-    local net = elapsed > 0 and (energy - first.energy) / elapsed or nil
+    local startTime, startEnergy = first.t, first.energy
+    if first.t < boundary and #history >= 2 then
+        local second = history[2]
+        local fraction = (boundary - first.t) / (second.t - first.t)
+        startTime = boundary
+        startEnergy = first.energy + (second.energy - first.energy) * fraction
+    end
+    local elapsed = t - startTime
+    local net = elapsed > 0 and (energy - startEnergy) / elapsed or nil
+    -- Time-weight the sampled tick rates over exactly the same five seconds.
+    -- Linear interpolation also handles a boundary between two observations.
+    local avgInput, avgOutput = input, output
+    if elapsed > 0 then
+        local totalInput, totalOutput = 0, 0
+        for i = 1, #history - 1 do
+            local a, b = history[i], history[i + 1]
+            local from, to = math.max(a.t, startTime), math.min(b.t, t)
+            if to > from then
+                local firstFraction = (from - a.t) / (b.t - a.t)
+                local lastFraction = (to - a.t) / (b.t - a.t)
+                local averageFraction = (firstFraction + lastFraction) / 2
+                totalInput = totalInput + (a.input + (b.input - a.input) * averageFraction) * (to - from)
+                totalOutput = totalOutput + (a.output + (b.output - a.output) * averageFraction) * (to - from)
+            end
+        end
+        avgInput, avgOutput = totalInput / elapsed, totalOutput / elapsed
+    end
     local status, eta, color = "MESSE...", "Messung laeuft...", C.lightGray
     if energy == 0 then
         status, eta, color = "LEER", "Speicher ist leer", C.red
@@ -163,8 +192,9 @@ local function measure()
     else
         status, eta = "STABIL", "Keine Netto-Aenderung"
     end
-    return {energy = energy, cap = cap, input = input, output = output,
-        net = net, percent = energy / cap * 100, status = status, eta = eta,
+    return {energy = energy, cap = cap, input = avgInput, output = avgOutput,
+        flowNet = avgInput - avgOutput, net = net,
+        percent = energy / cap * 100, status = status, eta = eta,
         color = color, name = name, elapsed = elapsed}
 end
 
@@ -194,8 +224,10 @@ local function newFrame(width, height)
             row[i] = row[i]:sub(1, x - 1) .. values[i] .. row[i]:sub(x + #text)
         end
     end
-    local function center(y, text, fg, bg)
-        put(math.max(1, math.floor((width - #text) / 2) + 1), y, text, fg, bg)
+    local function center(y, text, fg, bg, x, span)
+        x, span = x or 1, span or width
+        text = tostring(text):sub(1, span)
+        put(x + math.max(0, math.floor((span - #text) / 2)), y, text, fg, bg)
     end
     local function rectangle(x, y, w, h, color)
         for row = y, y + h - 1 do put(x, row, string.rep(" ", math.max(0, w)), C.white, color) end
@@ -248,30 +280,81 @@ local function renderData(data, width, height)
     if data.percent < 100 and pct == "100.0%" then pct = "99.9%" end
     local fillColor = data.percent <= 20 and C.red or (data.percent <= 50 and C.orange or C.green)
     local precision = width >= 28 and 2 or 1
-    local net = "Messung..."
-    if data.net then
-        net = (data.net > 0 and "+" or (data.net < 0 and "-" or ""))
-            .. formatEnergy(data.net, "/s", precision)
-    end
-    f.rect(1, 1, width, 1, C.gray)
-    f.center(1, width >= 20 and "INDUCTION MATRIX" or "MATRIX", C.white, C.gray)
+    local flowColor = data.flowNet > 0 and C.lime or (data.flowNet < 0 and C.orange or C.lightGray)
+    local flowSign = data.flowNet > 0 and "+" or (data.flowNet < 0 and "-" or "")
+    local net = flowSign .. formatEnergy(data.flowNet, "/t", precision)
+    f.rect(1, 1, width, 1, C.blue)
+    f.center(1, width >= 20 and "INDUCTION MATRIX" or "MATRIX", C.white, C.blue)
     if width >= 38 and height >= 22 then
+        f.put(2, 2, "ENERGIESPEICHER", C.lightGray)
+        f.put(width - #pct, 2, pct, C.cyan)
         local scale = math.max(1, math.min(2, math.floor((height - 17) / 5),
             math.floor((width - 4) / (#pct * 4 - 1))))
-        f.center(3, "Ladezustand: " .. pct, C.lightGray)
-        bigText(f, pct, 5, scale, width, fillColor)
-        local statusY = 6 + 5 * scale
-        f.center(statusY, data.status, data.color)
+        bigText(f, pct, 4, scale, width, C.white)
+        local statusY = 4 + 5 * scale
+        f.center(statusY, "  " .. data.status .. "  ", C.black, data.color)
         local barY = statusY + 2
         bar(f, barY, width, 2, data.percent, fillColor)
-        f.center(barY + 3, formatEnergy(data.energy) .. " / " .. formatEnergy(data.cap), C.lightGray)
-        f.put(3, barY + 5, "Eingang: " .. formatEnergy(data.input, "/t"), C.lime)
-        f.put(3, barY + 6, "Ausgang: " .. formatEnergy(data.output, "/t"), C.orange)
-        f.put(3, barY + 7, "Netto:   " .. net, data.color)
-        f.center(barY + 9, data.eta, data.color)
-        if height > barY + 10 then
-            f.center(height, "Restzeit: Trend der letzten "
-                .. math.floor(math.min(CONFIG.smoothingSeconds, data.elapsed)) .. "s", C.gray)
+
+        f.put(3, barY + 2, "0%", C.lightGray)
+        f.center(barY + 2, "50%", C.lightGray)
+        f.put(width - 5, barY + 2, "100%", C.lightGray)
+
+        local storageY, inner = barY + 4, width - 2
+        local leftWidth = math.floor((inner - 1) / 2)
+        local rightX = leftWidth + 3
+        local rightWidth = width - rightX
+        f.rect(2, storageY, leftWidth, 2, C.gray)
+        f.rect(rightX, storageY, rightWidth, 2, C.gray)
+        f.center(storageY, "GESPEICHERT", C.lightGray, C.gray, 2, leftWidth)
+        f.center(storageY + 1, formatEnergy(data.energy), C.white, C.gray, 2, leftWidth)
+        f.center(storageY, "KAPAZITAET", C.lightGray, C.gray, rightX, rightWidth)
+        f.center(storageY + 1, formatEnergy(data.cap), C.white, C.gray, rightX, rightWidth)
+
+        local flowY = storageY + 3
+        local cardWidth = math.floor((inner - 2) / 3)
+        local windowLabel = tostring(CONFIG.smoothingSeconds) .. "s"
+        if data.elapsed < CONFIG.smoothingSeconds then
+            windowLabel = math.floor(data.elapsed) .. "/" .. windowLabel
+        end
+        f.center(flowY - 1, "MITTELWERTE - " .. windowLabel, C.lightGray)
+        local cards = {
+            {"EINGANG", data.input, C.lime, ""},
+            {"AUSGANG", data.output, C.orange, ""},
+            {"NETTO", data.flowNet, flowColor, flowSign},
+        }
+        for i, card in ipairs(cards) do
+            local x = 2 + (i - 1) * (cardWidth + 1)
+            local span = i == 3 and (width - x) or cardWidth
+            -- Preserve two decimals whenever they fit, including narrow walls.
+            local digits = 2
+            local value = card[4] .. formatEnergy(card[2], "/t", digits)
+            while #value > span and digits > 0 do
+                digits = digits - 1
+                value = card[4] .. formatEnergy(card[2], "/t", digits)
+            end
+            f.rect(x, flowY, span, 2, C.gray)
+            f.center(flowY, card[1], C.lightGray, C.gray, x, span)
+            f.center(flowY + 1, value, card[3], C.gray, x, span)
+        end
+
+        local etaY = flowY + 3
+        local window = tostring(CONFIG.smoothingSeconds) .. "s"
+        local label = "PROGNOSE - LETZTE " .. window
+        if data.elapsed < CONFIG.smoothingSeconds then
+            label = "PROGNOSE - MESSUNG " .. math.floor(data.elapsed) .. "/" .. window
+        end
+        f.rect(2, etaY, inner, 2, C.blue)
+        f.center(etaY, label, C.lightGray, C.blue, 2, inner)
+        f.center(etaY + 1, data.eta, C.cyan, C.blue, 2, inner)
+        if height > etaY + 2 then
+            f.put(2, height, "o ONLINE", C.green)
+            local note = "Speichertrend: Messung..."
+            if data.net then
+                local sign = data.net > 0 and "+" or (data.net < 0 and "-" or "")
+                note = "Speichertrend: " .. sign .. formatEnergy(data.net, "/s")
+            end
+            f.put(width - #note, height, note, C.lightGray)
         end
     else
         f.center(2, pct, fillColor)
@@ -283,11 +366,13 @@ local function renderData(data, width, height)
         local long = width >= 28
         f.put(1, 6, (long and "Eingang: " or "In  ") .. formatEnergy(data.input, "/t", precision), C.lime)
         f.put(1, 7, (long and "Ausgang: " or "Out ") .. formatEnergy(data.output, "/t", precision), C.orange)
-        f.put(1, 8, (long and "Netto: " or "Net ") .. net, data.color)
+        f.put(1, 8, (long and "Netto: " or "Net ") .. net, flowColor)
         local eta = data.eta
         if not long then eta = eta:gsub(" in ca%. ", " ~ ") end
         f.center(9, eta, data.color)
-        if height >= 10 then f.center(height, "Prognose / " .. unit, C.gray) end
+        if height >= 10 then
+            f.center(height, "Mittel " .. CONFIG.smoothingSeconds .. "s / " .. unit, C.lightGray)
+        end
     end
     return f
 end
@@ -328,11 +413,15 @@ end
 local function connectMonitor()
     local device = peripheral.wrap(CONFIG.monitor)
     if not device or type(device.blit) ~= "function" or type(device.setTextScale) ~= "function" then
-        monitor, previousRows = nil, nil
+        monitor, previousRows, paletteApplied = nil, nil, false
         log("Kein Monitor links. Advanced Monitor direkt links am Computer anschliessen.")
         return false
     end
     monitor = device
+    if not paletteApplied and type(monitor.setPaletteColor) == "function" then
+        for color, value in pairs(THEME) do monitor.setPaletteColor(color, value) end
+        paletteApplied = true
+    end
     local w, h = monitor.getSize()
     local current = monitor.getTextScale()
     local target = CONFIG.textScale
@@ -412,6 +501,7 @@ while true do
         safeRefresh()
     elseif event == "peripheral" or event == "peripheral_detach" then
         previousRows = nil
+        if name == CONFIG.monitor then paletteApplied = false end
         safeRefresh()
     end
 end
