@@ -85,80 +85,237 @@ local function number(n,decimals)
     return string.format("%."..(decimals or 1).."f",n)
 end
 local function percent(n) return finite(n) and number(n*100,0).."%" or "-" end
+-- Terminal-local theme and buffered drawing keep the Pocket calm and readable.
+local THEME={
+    [colors.black]=0x080D14,[colors.gray]=0x142130,[colors.blue]=0x1B3046,
+    [colors.white]=0xE9F1F6,[colors.lightGray]=0x91A6B9,[colors.cyan]=0x58D1DC,
+    [colors.green]=0x35B78C,[colors.lime]=0x7DE2BB,[colors.orange]=0xEFB366,
+    [colors.red]=0xED7483,[colors.yellow]=0xEFB366,
+}
+local originalPalette,themeApplied={},false
+local previousRows,previousWidth,previousHeight
+local seenNote,seenNoteAt=nil,0
+local function theme()
+    if themeApplied then return end
+    themeApplied=true
+    if type(term.setPaletteColor)~="function" then return end
+    for color,value in pairs(THEME) do
+        if type(term.getPaletteColor)=="function" then
+            local ok,r,g,b=pcall(term.getPaletteColor,color)
+            if ok then originalPalette[color]={r,g,b} end
+        end
+        pcall(term.setPaletteColor,color,value)
+    end
+end
+local function restorePalette()
+    for color,rgb in pairs(originalPalette) do pcall(term.setPaletteColor,color,table.unpack(rgb)) end
+end
+local function code(c)
+    local n=0;while c>1 do c=c/2;n=n+1 end
+    return ("0123456789abcdef"):sub(n+1,n+1)
+end
+local FONT={
+    ['0']={'111','101','101','101','111'},['1']={'010','110','010','010','111'},
+    ['2']={'111','001','111','100','111'},['3']={'111','001','111','001','111'},
+    ['4']={'101','101','111','001','001'},['5']={'111','100','111','001','111'},
+    ['6']={'111','100','111','101','111'},['7']={'111','001','010','010','010'},
+    ['8']={'111','101','111','101','111'},['9']={'111','101','111','001','111'},
+    ['.']={'000','000','000','000','010'},['%']={'101','001','010','100','101'},
+}
 local function draw()
+    theme()
     local w,h=term.getSize()
+    local rows={}
+    for y=1,h do rows[y]={string.rep(' ',w),string.rep(code(colors.white),w),string.rep(code(colors.black),w)} end
     hits={}
     local function put(x,y,text,fg,bg,width)
         if x<1 or y<1 or x>w or y>h then return end
         local limit=math.min(width or w-x+1,w-x+1)
         if limit<=0 then return end
-        text=safeText(text):sub(1,limit)
-        term.setCursorPos(x,y);term.setTextColor(fg or colors.white);term.setBackgroundColor(bg or colors.black)
-        term.write(text..string.rep(" ",limit-#text))
+        text=safeText(text):sub(1,limit);text=text..string.rep(' ',limit-#text)
+        local values={text,string.rep(code(fg or colors.white),limit),string.rep(code(bg or colors.black),limit)}
+        for i=1,3 do rows[y][i]=rows[y][i]:sub(1,x-1)..values[i]..rows[y][i]:sub(x+limit) end
     end
-    term.setBackgroundColor(colors.black);term.setTextColor(colors.white);term.clear();term.setCursorBlink(false)
-    local split=math.max(1,math.floor(w/2))
-    put(1,1," MATRIX",colors.white,page=="matrix" and colors.blue or colors.gray,split)
-    put(split+1,1," REAKTOR",colors.white,page=="reactor" and colors.blue or colors.gray,w-split)
+    local function rect(x,y,width,height,bg)
+        for row=y,y+height-1 do put(x,row,'',colors.white,bg,width) end
+    end
+    local function center(y,text,fg,bg,x,span)
+        x,span=x or 1,span or w
+        text=safeText(text):sub(1,math.max(0,span))
+        put(x+math.max(0,math.floor((span-#text)/2)),y,text,fg,bg,#text)
+    end
+    local function field(y,label,value,fg,bg)
+        if y<3 or y>=h then return end
+        rect(2,y,w-2,1,bg or colors.black)
+        label,value=safeText(label),safeText(value)
+        local available=math.max(1,w-#label-4)
+        value=value:sub(1,available)
+        put(2,y,label,colors.lightGray,bg,#label)
+        put(math.max(2+#label+1,w-#value),y,value,fg,bg,#value)
+    end
+    local function wrap(y,message,count,fg,bg)
+        local width=math.max(1,w-2)
+        local lines,line={},''
+        for word in safeText(message):gmatch('%S+') do
+            if #line>0 and #line+#word+1>width then lines[#lines+1]=line;line='' end
+            while #word>width do
+                if #line>0 then lines[#lines+1]=line;line='' end
+                lines[#lines+1]=word:sub(1,width);word=word:sub(width+1)
+            end
+            if #word>0 then line=#line>0 and line..' '..word or word end
+        end
+        if #line>0 then lines[#lines+1]=line end
+        for i=1,math.min(count,#lines) do
+            local text=lines[i]
+            if i==count and #lines>count and width>=3 then text=text:sub(1,width-3)..'...' end
+            put(2,y+i-1,text,fg,bg,width)
+        end
+    end
     local live=fresh()
-    put(1,2,(live and "ONLINE" or "ALTE DATEN / OFFLINE").." H"..hostID,live and colors.lime or colors.orange)
-    put(1,3,pending and "Warte auf Bestaetigung" or note,colors.yellow)
     local snapshot=tableOr(data)
     local m,r=tableOr(snapshot.matrix),tableOr(snapshot.reactor)
-    if page=="matrix" then
+    local split=math.max(1,math.floor(w/2))
+    rect(1,1,split,1,page=='matrix' and colors.blue or colors.gray)
+    rect(split+1,1,w-split,1,page=='reactor' and colors.blue or colors.gray)
+    center(1,'MATRIX',page=='matrix' and colors.cyan or colors.lightGray,page=='matrix' and colors.blue or colors.gray,1,split)
+    center(1,'REAKTOR',page=='reactor' and colors.cyan or colors.lightGray,page=='reactor' and colors.blue or colors.gray,split+1,w-split)
+    put(2,2,(live and 'ONLINE H' or (data and 'ALTE DATEN H' or 'OFFLINE H'))..hostID,live and colors.lime or colors.orange,nil,math.max(1,w-7))
+    put(math.max(1,w-3),2,'5s',colors.lightGray,nil,math.min(3,w))
+    local alert
+    local alertTone=colors.orange
+    if note~=seenNote then seenNote,seenNoteAt=note,clock() end
+    if pending then alert='Warte auf Bestaetigung'
+    elseif note:find('ABGELEHNT:',1,true)==1 then alert=note:gsub('^ABGELEHNT:%s*','Abgelehnt: ')
+    elseif note:find('Unbestaetigt',1,true)==1 or note:find('Nicht gesendet',1,true)==1 then alert=note
+    elseif note:find('OK:',1,true)==1 and clock()-seenNoteAt<=4 then alert,alertTone=note,colors.lime end
+    local function message(y,count,text,tone)
+        if text then wrap(y,text,count,tone or colors.orange,colors.gray) end
+    end
+    if page=='matrix' then
         local factor=finite(snapshot.factor) and snapshot.factor>0 and snapshot.factor or 1
-        local unit=snapshot.unit=="FE" and "FE" or "J"
-        put(1,4,"MATRIX "..number(m.percent,1).."%",colors.cyan)
-        local fill=finite(m.percent) and math.floor(math.max(0,math.min(100,m.percent))*w/100+.5) or 0
-        put(1,5,string.rep(" ",fill),colors.white,live and colors.green or colors.gray,fill)
-        put(fill+1,5,string.rep(" ",w-fill),colors.white,colors.gray,w-fill)
-        put(1,6,"Gesp "..fmt(m.energy,unit,factor))
-        put(1,7,"Kap  "..fmt(m.cap,unit,factor),colors.lightGray)
-        put(1,8,"Ein  "..fmt(m.input,unit.."/t",factor),colors.lime)
-        put(1,9,"Aus  "..fmt(m.output,unit.."/t",factor),colors.orange)
-        local flowNet=m.flowNet
-        if not finite(flowNet) and finite(m.input) and finite(m.output) then flowNet=m.input-m.output end
-        put(1,10,"Net  "..fmt(flowNet,unit.."/t",factor),colors.cyan)
-        put(1,11,"dE   "..fmt(m.net,unit.."/s",factor),colors.lightGray)
-        put(1,12,m.status or "Keine Messwerte")
-        put(1,13,"Rest "..safeText(m.eta))
-        if snapshot.error then put(1,14,snapshot.error,colors.red) end
-        put(1,h-1,"r / REAKTOR: Bedienung",colors.lightGray)
+        local unit=snapshot.unit=='FE' and 'FE' or 'J'
+        local pct=number(m.percent,1)..'%'
+        if finite(m.percent) and m.percent<100 and pct=='100.0%' then pct='99.9%' end
+        local fillColor=finite(m.percent) and (m.percent<=20 and colors.red or (m.percent<=50 and colors.orange or colors.cyan)) or colors.gray
+        local roomy=w>=24 and h>=20
+        local storageY,flowY,forecastY=roomy and 10 or 6,roomy and 12 or 8,roomy and 16 or 12
+        if roomy then
+            rect(2,3,w-2,7,colors.gray)
+            put(3,3,'SPEICHER',colors.lightGray,colors.gray,8)
+            put(w-#pct-1,3,pct,fillColor,colors.gray,#pct)
+            local big=pct:gsub('%.0%%','%%')
+            if #big*4-1<=w-4 then
+                local start=math.floor((w-(#big*4-1))/2)+1
+                for i=1,#big do
+                    local glyph=FONT[big:sub(i,i)]
+                    if glyph then for gy=1,5 do for gx=1,3 do
+                        if glyph[gy]:sub(gx,gx)=='1' then rect(start+(i-1)*4+gx-1,gy+3,1,1,colors.white) end
+                    end end end
+                end
+            else center(6,pct,colors.white,colors.gray) end
+        else
+            put(2,3,'SPEICHER '..pct,fillColor)
+        end
+        local barY=roomy and 9 or 4
+        local inner=math.max(0,w-4)
+        local fill=finite(m.percent) and math.floor(math.max(0,math.min(100,m.percent))*inner/100+.5) or 0
+        rect(3,barY,inner,1,colors.blue);rect(3,barY,fill,1,live and fillColor or colors.gray)
+        field(storageY,'Gesp',fmt(m.energy,unit,factor),colors.white)
+        field(storageY+1,'Kap',fmt(m.cap,unit,factor),colors.lightGray)
+        field(flowY,'Ein',fmt(m.input,unit..'/t',factor),colors.lime,colors.gray)
+        field(flowY+1,'Aus',fmt(m.output,unit..'/t',factor),colors.orange,colors.gray)
+        local net=m.flowNet
+        if not finite(net) and finite(m.input) and finite(m.output) then net=m.input-m.output end
+        local sign=finite(net) and net>0 and '+' or ''
+        field(flowY+2,'Net',sign..fmt(net,unit..'/t',factor),finite(net) and net<0 and colors.orange or colors.lime,colors.gray)
+        field(flowY+3,'Trend',fmt(m.net,unit..'/s',factor),colors.lightGray)
+        if forecastY<h then
+            rect(2,forecastY,w-2,2,colors.blue)
+            center(forecastY,m.status or 'WARTE AUF DATEN',m.status=='ENTLAEDT' and colors.orange or colors.lime,colors.blue,2,w-2)
+            center(forecastY+1,safeText(m.eta):gsub(' in ca%. ',' in '),colors.white,colors.blue,2,w-2)
+        end
+        message(forecastY+2,math.max(0,h-forecastY-2),snapshot.error or alert,snapshot.error and colors.red or alertTone)
     else
         local buttonHeight=h>=17 and 2 or 1
         local top=math.max(4,h-3*buttonHeight)
-        local function body(y,text,fg) if y<top then put(1,y,text,fg) end end
+        local statusTop=math.max(4,math.min(12,top-2))
         local readings=tableOr(r.readings)
-        body(4,"FISSION "..safeText(r.mode),r.mode=="FAULT" and colors.red or colors.cyan)
-        body(5,snapshot.addonError or r.reason or "Keine Reaktordaten",colors.lightGray)
-        body(6,"Ist "..number(readings.actual,2).." Soll "..number(readings.rate,2))
-        body(7,"Max "..number(r.ceiling,2).." W "..number(r.coolingCeiling,2))
-        body(8,"Temp "..number(readings.temperature,0).." K",colors.orange)
-        body(9,"Wasser "..percent(readings.water).." Dampf "..percent(readings.steam))
-        body(10,"Abf "..percent(readings.waste).." Brenn "..percent(readings.fuel))
-        body(11,"Schaden "..number(readings.damage,0).."% "..safeText(r.calibration))
-        body(12,r.stopError or r.notice or "m: Matrix / q: Ende",r.stopError and colors.red or colors.lightGray)
-        body(13,(not live and "Bedienung gesperrt: offline") or "Nur farbige Tasten aktiv",colors.lightGray)
+        local function body(y,text,fg,bg) if y<statusTop then put(2,y,text,fg,bg,w-2) end end
+        local function card(y,label,value,fg,bg) if y<statusTop then field(y,label,value,fg,bg) end end
+        if 3<top then
+            rect(2,3,w-2,1,colors.gray)
+            put(3,3,'FISSION',colors.lightGray,colors.gray,7)
+            local mode=safeText(r.mode)
+            put(math.max(3,w-#mode-1),3,mode,r.mode=='FAULT' and colors.red or colors.cyan,colors.gray,#mode)
+        end
+        card(4,'IST / SOLL','mB/t',colors.lightGray)
+        if 5<statusTop then
+            rect(2,5,w-2,1,colors.blue)
+            center(5,number(readings.actual,2)..' / '..number(readings.rate,2),colors.white,colors.blue,2,w-2)
+        end
+        body(6,'Max '..number(r.ceiling,2)..'  Wasser '..number(r.coolingCeiling,1),colors.lightGray)
+        body(7,'Temp '..number(readings.temperature,0)..'K Schaden '..number(readings.damage,0)..'%',finite(readings.damage) and readings.damage>0 and colors.red or colors.white)
+        if 8<statusTop then
+            local half=math.max(1,math.floor((w-3)/2))
+            center(8,'WASSER '..percent(readings.water),colors.cyan,nil,2,half)
+            center(8,'DAMPF '..percent(readings.steam),colors.orange,nil,half+3,w-half-3)
+            local function tank(x,span,value,color)
+                if 9>=statusTop then return end
+                local n=finite(value) and math.floor(math.max(0,math.min(1,value))*span+.5) or 0
+                rect(x,9,span,1,colors.gray);rect(x,9,n,1,color)
+            end
+            tank(2,half,readings.water,colors.cyan)
+            tank(half+3,w-half-3,readings.steam,colors.orange)
+        end
+        body(10,'Abfall '..percent(readings.waste)..'  Brenn '..percent(readings.fuel),colors.lightGray)
+        body(11,'Kalibriert: '..safeText(r.calibration),colors.cyan)
+        local status=r.stopError or snapshot.addonError or (r.mode=='FAULT' and r.reason)
+            or alert or r.notice or r.reason
+        local tone=(r.stopError or snapshot.addonError or r.mode=='FAULT') and colors.red
+            or (alert and alertTone or colors.lightGray)
+        message(statusTop,math.max(0,math.min(2,top-statusTop)),status,tone)
         local actions=tableOr(r.actions)
-        local reactorAvailable=type(snapshot.reactor)=="table" and snapshot.addonError==nil
+        local available=type(snapshot.reactor)=='table' and snapshot.addonError==nil
         for i=1,6 do
             local a=tableOr(actions[i])
-            local action=labels[a.id] and a.id or nil
-            local label=action and labels[action] or ({"AUTO","PAUSE","NOT-AUS","RESET","MAX -","MAX +"})[i]
+            local id=labels[a.id] and a.id or nil
+            local label=id and labels[id] or ({'AUTO','PAUSE','NOT-AUS','RESET','MAX -','MAX +'})[i]
             local col=(i-1)%2
-            local x=col==0 and 1 or split+1
-            local width=col==0 and split or w-split
+            local x=col==0 and 2 or split+2
+            local span=col==0 and split-2 or w-split-2
             local y=top+math.floor((i-1)/2)*buttonHeight
-            local enabled=live and reactorAvailable and not pending and a.enabled==true and action~=nil
-            local bg=enabled and (action=="scram" and colors.red or colors.blue) or colors.gray
-            for line=0,buttonHeight-1 do put(x,y+line,line==0 and " "..label or "",enabled and colors.white or colors.lightGray,bg,width) end
-            if enabled and x<=w and y<=h and width>0 then
-                hits[#hits+1]={x=x,y=y,w=width,h=math.min(buttonHeight,h-y+1),id=action}
+            local enabled=live and available and not pending and a.enabled==true and id~=nil
+            local bg=enabled and (id=='scram' and colors.red or colors.blue) or colors.gray
+            local fg=enabled and (id=='scram' and colors.black or colors.white) or colors.lightGray
+            rect(x,y,span,buttonHeight,bg)
+            center(y,label,fg,bg,x,span)
+            if buttonHeight>1 then center(y+1,enabled and 'bereit' or (not live and 'offline' or (pending and 'wartet' or 'gesperrt')),fg,bg,x,span) end
+            if enabled and x<=w and y<=h and span>0 then hits[#hits+1]={x=x,y=y,w=span,h=math.min(buttonHeight,h-y+1),id=id} end
+        end
+    end
+    put(1,h,'m MATRIX r REAKTOR q ENDE',colors.lightGray,colors.gray,w)
+    if previousWidth~=w or previousHeight~=h then previousRows=nil end
+    term.setCursorBlink(false)
+    for y,row in ipairs(rows) do
+        local old=previousRows and previousRows[y]
+        if not old or row[1]~=old[1] or row[2]~=old[2] or row[3]~=old[3] then
+            if type(term.blit)=='function' then
+                term.setCursorPos(1,y);term.blit(row[1],row[2],row[3])
+            else
+                local x=1
+                while x<=w do
+                    local last=x
+                    while last<w and row[2]:sub(last+1,last+1)==row[2]:sub(x,x) and row[3]:sub(last+1,last+1)==row[3]:sub(x,x) do last=last+1 end
+                    term.setCursorPos(x,y)
+                    term.setTextColor(2^tonumber(row[2]:sub(x,x),16));term.setBackgroundColor(2^tonumber(row[3]:sub(x,x),16))
+                    term.write(row[1]:sub(x,last));x=last+1
+                end
             end
         end
     end
-    put(1,h,"m:Matrix r:Reaktor q:Ende",colors.gray)
+    previousRows,previousWidth,previousHeight=rows,w,h
 end
+
 local function receive(sender,p,protocol)
     if sender~=hostID or protocol~=PROTOCOL or type(p)~="table" or getmetatable(p)~=nil
         or p.v~=1 or p.clientSession~=session then return end
@@ -223,6 +380,7 @@ local function run()
     end
 end
 local ok,err=pcall(run)
+restorePalette()
 term.setBackgroundColor(colors.black);term.setTextColor(colors.white);term.clear();term.setCursorPos(1,1)
 if not ok and not tostring(err):find("Terminated",1,true) then printError(safeText(err)) end
 print("Pocket beendet.")
