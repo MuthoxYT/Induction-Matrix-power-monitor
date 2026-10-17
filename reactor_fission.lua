@@ -20,7 +20,9 @@ local CONFIG = {
     tripTemperature = 1000, resetTemperature = 600, -- Kelvin
     tripWater = 0.50, resetWater = 0.95,
     throttleWater = 0.90, coolingStepSeconds = 1,
-    coolingReduction = 0.20, fullWater = 0.999999, fullIncreasesRequired = 3,
+    -- Match the monitor's whole-percent 100% band; ignore refill jitter in it.
+    coolingDownStep = 0.1, urgentWater = 0.80, urgentDownStep = 1,
+    fullWater = 0.995, fullIncreasesRequired = 3,
     tripSteam = 0.80, resetSteam = 0.20,
     tripWaste = 0.80, resetWaste = 0.50,
     startRate = 0.1, rampStep = 0.1, rampSeconds = 2,
@@ -204,12 +206,13 @@ function M.create(context)
         -- Use fresh raw pairs: averaging must not hide an approaching dry tank.
         local continuous = previousWaterAt and t > previousWaterAt
             and t - previousWaterAt <= CONFIG.maxAgeSeconds
-        local falling = continuous and r.water < previousWater - 0.000001
+        local falling = continuous and r.water < CONFIG.fullWater
+            and r.water < previousWater - 0.000001
         previousWater, previousWaterAt = r.water, t
         if not r.active then fullIncreases, pendingIncrease = 0, nil; return false end
         if not continuous or falling or r.water < CONFIG.fullWater then
             fullIncreases, pendingIncrease = 0, nil
-            calibrationFast = false
+            if not continuous or r.water <= CONFIG.throttleWater then calibrationFast = false end
         elseif pendingIncrease then
             if math.abs(r.rate - pendingIncrease.rate) > 0.000001 then
                 fullIncreases, pendingIncrease = 0, nil
@@ -219,15 +222,17 @@ function M.create(context)
                 if fullIncreases >= CONFIG.fullIncreasesRequired then calibrationFast = true end
             end
         end
-        if (falling or (not continuous and r.water < CONFIG.throttleWater))
+        if r.water <= CONFIG.throttleWater and (falling or not continuous)
             and (not lastCoolingReduction or t - lastCoolingReduction >= CONFIG.coolingStepSeconds) then
             local reduced = math.max(CONFIG.startRate,
-                math.floor(math.min(r.rate * (1 - CONFIG.coolingReduction),
-                    r.rate - CONFIG.rampStep) * 100 + 0.000001) / 100)
+                math.floor((r.rate - (r.water <= CONFIG.urgentWater
+                    and CONFIG.urgentDownStep or CONFIG.coolingDownStep)) * 100 + 0.000001) / 100)
             coolingLimit = math.min(coolingLimit or math.huge, reduced)
             lastCoolingReduction = t
         end
-        return falling
+        -- Only this reserve boundary constrains running power. Full-water
+        -- detection above it is used for confirmation credits, not derating.
+        return r.water <= CONFIG.throttleWater
     end
     local self = {}
     function self.update(matrix, now)
@@ -273,7 +278,7 @@ function M.create(context)
                 else notice = "RESET gesperrt: kalt, sicher und gestoppt erforderlich" end
             end
             if mode == "FAULT" or latch then stop(); return end
-            local waterFalling = cooling(r, t)
+            local waterLimited = cooling(r, t)
             local resuming = mode == "PAUSE" and resumeRequested and resumeRate ~= nil
             if mode == "PAUSE" and resumeRate and r.active then
                 error("Unerwarteter Start waehrend manueller Pause",0)
@@ -333,14 +338,14 @@ function M.create(context)
             local seconds = calibrationFast and CONFIG.fastRampSeconds or CONFIG.rampSeconds
             local ready = t - lastRamp >= seconds
             -- Probe supply only when demand can actually use the increase.
-            if coolingLimit and ready and not waterFalling and r.water >= CONFIG.resetWater
+            if coolingLimit and ready and not waterLimited
                 and r.rate >= math.min(limit, batteryTarget) - 0.001 and batteryTarget > r.rate then
                 coolingLimit = math.min(ceiling, r.max, coolingLimit + step)
                 limit = math.min(ceiling, r.max, coolingLimit)
             end
             local target = math.min(limit, batteryTarget)
             -- Recovery cannot race the normal battery ramp or a saved resume rate.
-            if waterFalling or r.water < CONFIG.resetWater then target = math.min(target, r.rate) end
+            if waterLimited then target = math.min(target, r.rate) end
             local nextRate = r.rate
             if nextRate > target then nextRate = target
             elseif ready then nextRate = math.min(target, nextRate + step) end
@@ -349,7 +354,7 @@ function M.create(context)
                 freshness(matrix, started)
                 nextRate = math.min(nextRate, ceiling, liveCap)
                 command("setBurnRate", nextRate)
-                if nextRate > r.rate and r.water >= CONFIG.fullWater and not waterFalling then
+                if nextRate > r.rate and r.water >= CONFIG.fullWater and not waterLimited then
                     pendingIncrease = {rate=nextRate, at=clock(), seconds=seconds}
                 else fullIncreases, pendingIncrease = 0, nil end
                 r.rate = nextRate
@@ -357,8 +362,11 @@ function M.create(context)
             end
             mode, reason = "AUTO", "Regelt nach Matrix-Fuellstand"
             if coolingLimit then
-                reason = string.format("Wasser begrenzt: %.2f mB/t", math.min(coolingLimit, ceiling, r.max))
-            elseif waterFalling or r.water < CONFIG.resetWater then
+                local cap = math.min(coolingLimit, ceiling, r.max)
+                if not waterLimited then
+                    reason = string.format("Kalibriert %s | Limit %.2f", calibrationFast and "SCHNELL" or "LANGSAM", cap)
+                else reason = string.format("Wasser begrenzt: %.2f mB/t", cap) end
+            elseif waterLimited then
                 reason = "Wasser erholt sich - Leistung halten"
             else
                 reason = "Kalibriert: " .. (calibrationFast and "SCHNELL" or "LANGSAM")
