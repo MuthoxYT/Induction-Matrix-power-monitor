@@ -20,10 +20,11 @@ local CONFIG = {
     tripTemperature = 1000, resetTemperature = 600, -- Kelvin
     tripWater = 0.50, resetWater = 0.95,
     throttleWater = 0.90, coolingStepSeconds = 1,
-    coolingReduction = 0.20, coolingRecoverySeconds = 10,
+    coolingReduction = 0.20, fullWater = 0.999999, fullIncreasesRequired = 3,
     tripSteam = 0.80, resetSteam = 0.20,
     tripWaste = 0.80, resetWaste = 0.50,
     startRate = 0.1, rampStep = 0.1, rampSeconds = 2,
+    fastRampStep = 0.5, fastRampSeconds = 1,
     ceilingStep = 1, maxAgeSeconds = 2,
 }
 
@@ -103,7 +104,12 @@ function M.create(context)
     local lastRamp, resetRequested = 0, false
     local resumeRate, resumeRequested = nil, false -- memory only, normal manual pause
     -- Learned supply limit is memory only and survives normal PAUSE/STANDBY.
-    local coolingLimit, previousWater, previousWaterAt, lastCoolingReduction, recoverySince
+    local coolingLimit, previousWater, previousWaterAt, lastCoolingReduction
+    local calibrationFast, fullIncreases, pendingIncrease = true, 0, nil
+    local function resetCalibration()
+        coolingLimit, previousWater, previousWaterAt, lastCoolingReduction = nil, nil, nil, nil
+        calibrationFast, fullIncreases, pendingIncrease = true, 0, nil
+    end
     local function persist()
         local ok, err = protected(writeState, {version = 1, ceiling = ceiling, latch = latch})
         if not ok then
@@ -153,7 +159,8 @@ function M.create(context)
     end
     local function trip(message)
         resumeRate, resumeRequested = nil, false
-        previousWater, previousWaterAt, recoverySince = nil, nil, nil
+        previousWater, previousWaterAt, pendingIncrease = nil, nil, nil
+        calibrationFast, fullIncreases = false, 0
         mode, reason = "FAULT", tostring(message)
         if not latch then latch = reason; persist() end
         if persistenceError then reason = persistenceError end
@@ -199,26 +206,26 @@ function M.create(context)
             and t - previousWaterAt <= CONFIG.maxAgeSeconds
         local falling = continuous and r.water < previousWater - 0.000001
         previousWater, previousWaterAt = r.water, t
-        if not r.active then recoverySince = nil; return false end
-        if r.water < CONFIG.throttleWater and (falling or not continuous)
+        if not r.active then fullIncreases, pendingIncrease = 0, nil; return false end
+        if not continuous or falling or r.water < CONFIG.fullWater then
+            fullIncreases, pendingIncrease = 0, nil
+            calibrationFast = false
+        elseif pendingIncrease then
+            if math.abs(r.rate - pendingIncrease.rate) > 0.000001 then
+                fullIncreases, pendingIncrease = 0, nil
+            elseif t - pendingIncrease.at >= pendingIncrease.seconds then
+                fullIncreases = math.min(CONFIG.fullIncreasesRequired, fullIncreases + 1)
+                pendingIncrease = nil
+                if fullIncreases >= CONFIG.fullIncreasesRequired then calibrationFast = true end
+            end
+        end
+        if (falling or (not continuous and r.water < CONFIG.throttleWater))
             and (not lastCoolingReduction or t - lastCoolingReduction >= CONFIG.coolingStepSeconds) then
             local reduced = math.max(CONFIG.startRate,
                 math.floor(math.min(r.rate * (1 - CONFIG.coolingReduction),
                     r.rate - CONFIG.rampStep) * 100 + 0.000001) / 100)
             coolingLimit = math.min(coolingLimit or math.huge, reduced)
             lastCoolingReduction = t
-        end
-        -- A cap learned under load only grows after ten continuous seconds of
-        -- recovered water at that cap. Each probe adds at most 0.1 mB/t.
-        if not continuous or falling or r.water < CONFIG.resetWater then recoverySince = nil end
-        if r.water >= CONFIG.resetWater and not falling and continuous then
-            if coolingLimit and r.rate >= math.min(coolingLimit, ceiling, r.max) - 0.001 then
-                recoverySince = recoverySince or t
-                if t - recoverySince >= CONFIG.coolingRecoverySeconds then
-                    coolingLimit = math.min(ceiling, r.max, coolingLimit + CONFIG.rampStep)
-                    recoverySince = t
-                end
-            else recoverySince = nil end
         end
         return falling
     end
@@ -256,9 +263,13 @@ function M.create(context)
             if persistenceError then error(persistenceError, 0) end
             if resetRequested then
                 resetRequested = false
-                if mode == "FAULT" and healthyForStart(r, false) and not r.active and not stopError then
+                if (mode == "FAULT" or mode == "PAUSE") and healthyForStart(r, false) and not r.active and not stopError then
                     latch = false
-                    if persist() then mode, reason = "PAUSE", "Quittiert - AUTO separat einschalten" end
+                    if persist() then
+                        resetCalibration()
+                        resumeRate, resumeRequested = nil, false
+                        mode, reason = "PAUSE", "RESET: Wassergrenze geloescht - AUTO einschalten"
+                    end
                 else notice = "RESET gesperrt: kalt, sicher und gestoppt erforderlich" end
             end
             if mode == "FAULT" or latch then stop(); return end
@@ -318,17 +329,29 @@ function M.create(context)
             if not expectedActive then error("Unerwartet aktiver Reaktor", 0) end
             local fraction = math.max(0, math.min(1, (CONFIG.stopPercent - matrix.percent) / CONFIG.stopPercent))
             local batteryTarget = math.max(CONFIG.startRate, math.min(ceiling, r.max) * fraction * fraction)
+            local step = calibrationFast and CONFIG.fastRampStep or CONFIG.rampStep
+            local seconds = calibrationFast and CONFIG.fastRampSeconds or CONFIG.rampSeconds
+            local ready = t - lastRamp >= seconds
+            -- Probe supply only when demand can actually use the increase.
+            if coolingLimit and ready and not waterFalling and r.water >= CONFIG.resetWater
+                and r.rate >= math.min(limit, batteryTarget) - 0.001 and batteryTarget > r.rate then
+                coolingLimit = math.min(ceiling, r.max, coolingLimit + step)
+                limit = math.min(ceiling, r.max, coolingLimit)
+            end
             local target = math.min(limit, batteryTarget)
             -- Recovery cannot race the normal battery ramp or a saved resume rate.
             if waterFalling or r.water < CONFIG.resetWater then target = math.min(target, r.rate) end
             local nextRate = r.rate
             if nextRate > target then nextRate = target
-            elseif t - lastRamp >= CONFIG.rampSeconds then nextRate = math.min(target, nextRate + CONFIG.rampStep) end
+            elseif ready then nextRate = math.min(target, nextRate + step) end
             if nextRate ~= r.rate then
                 local liveCap = requireNumber(device.getMaxBurnRate(), 0.1, 1000000, "Strukturmaximum")
                 freshness(matrix, started)
                 nextRate = math.min(nextRate, ceiling, liveCap)
                 command("setBurnRate", nextRate)
+                if nextRate > r.rate and r.water >= CONFIG.fullWater and not waterFalling then
+                    pendingIncrease = {rate=nextRate, at=clock(), seconds=seconds}
+                else fullIncreases, pendingIncrease = 0, nil end
                 r.rate = nextRate
                 lastRamp = clock()
             end
@@ -337,6 +360,8 @@ function M.create(context)
                 reason = string.format("Wasser begrenzt: %.2f mB/t", math.min(coolingLimit, ceiling, r.max))
             elseif waterFalling or r.water < CONFIG.resetWater then
                 reason = "Wasser erholt sich - Leistung halten"
+            else
+                reason = "Kalibriert: " .. (calibrationFast and "SCHNELL" or "LANGSAM")
             end
         end)
         if not success then resetRequested = false; trip(err) end
@@ -371,11 +396,12 @@ function M.create(context)
                 resumeRequested = true
             end
         elseif id == "reset" then
-            resumeRate, resumeRequested = nil, false
-            if mode == "PAUSE" then reason = "Pause - AUTO separat einschalten" end
-            resetRequested = true
+            if mode == "FAULT" or mode == "PAUSE" then
+                resumeRate, resumeRequested = nil, false
+                resetRequested = true
+            end
         elseif id == "auto" then
-            if mode == "PAUSE" and not resumeRate and not latch and not persistenceError then
+            if mode == "PAUSE" and not resumeRate and not resetRequested and not latch and not persistenceError then
                 if persist() then mode, reason = "AUTO", "AUTO angefordert - pruefe frische Messwerte"
                 else trip(persistenceError) end
             end
@@ -393,12 +419,13 @@ function M.create(context)
         local resumable = mode == "PAUSE" and resumeRate ~= nil and not latch and not persistenceError
         return {mode = mode, reason = reason, notice = notice, stopError = stopError,
             ceiling = ceiling, coolingCeiling = coolingLimit,
+            calibration = calibrationFast and "SCHNELL" or "LANGSAM", fullIncreases = fullIncreases,
             name = deviceName, readings = readings, matrixPercent = matrixPercent,
             actions = {
-                {id="auto",label="AUTO",enabled=mode=="PAUSE" and not resumeRate and not latch and not persistenceError},
+                {id="auto",label="AUTO",enabled=mode=="PAUSE" and not resumeRate and not resetRequested and not latch and not persistenceError},
                 {id=resumable and "resume" or "pause",label=resumable and "WEITER" or "PAUSE",enabled=true},
                 {id="scram",label="NOT-AUS",enabled=true},
-                {id="reset",label="RESET",enabled=mode=="FAULT" and not persistenceError},
+                {id="reset",label="RESET",enabled=(mode=="FAULT" or mode=="PAUSE") and not persistenceError},
                 {id="max_minus",label="MAX -",enabled=editable},
                 {id="max_plus",label="MAX +",enabled=editable and ceiling < readings.max},
             }}
