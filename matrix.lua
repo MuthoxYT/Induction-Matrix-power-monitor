@@ -1,7 +1,7 @@
 -- Induction Matrix Monitor for CC: Tweaked / Mekanism (Minecraft 1.21.1)
 -- Monitor directly on the LEFT; matrix connected through a wired modem.
--- Upload this single file to GitHub, then download its RAW URL with wget.
--- All peripheral calls are read-only. Stop with Ctrl+T.
+-- Optional reactor_fission.lua in the same folder adds active reactor control.
+-- Matrix access remains read-only. Ctrl+T requests reactor SCRAM if installed.
 
 local CONFIG = {
     monitor = "left",
@@ -10,6 +10,7 @@ local CONFIG = {
     refreshSeconds = 0.5,
     smoothingSeconds = 5,   -- rolling observation window for trend and ETA
     textScale = nil,        -- nil = automatic; otherwise 0.5, 1, 1.5, ... 5
+    reactorModule = "reactor_fission.lua", -- relative to THIS script; nil disables
 }
 
 local C = colors
@@ -18,6 +19,15 @@ local previousRows, previousWidth, previousHeight
 local lastLog, timer
 local factor, unit = 1, "J"
 local paletteApplied = false
+local reactor, addonError, addonPresent, page, hits = nil, nil, false, "matrix", {}
+local terminating = false
+local function protected(fn, ...)
+    local ok, value, b, c = pcall(fn, ...)
+    -- CC main-thread peripheral calls may raise this while yielding rather
+    -- than return a raw terminate event to our outer event loop.
+    if not ok and value == "Terminated" then terminating = true end
+    return ok, value, b, c
+end
 
 -- A monitor-local palette keeps panels distinct without harsh default colors.
 local THEME = {
@@ -33,7 +43,7 @@ if CONFIG.displayUnit == "FE" then
     for _, helperName in ipairs({"computerEnergyHelper", "mekanismEnergyHelper"}) do
         local helper = _G[helperName]
         if helper and type(helper.joulesToFE) == "function" then
-            local ok, value = pcall(helper.joulesToFE, 1000000)
+            local ok, value = protected(helper.joulesToFE, 1000000)
             value = ok and tonumber(value) or nil
             if value and value > 0 and value < math.huge then
                 factor, unit = value / 1000000, "FE"
@@ -125,6 +135,7 @@ local function findMatrix()
 end
 
 local function measure()
+    local sampledAt = now() -- age includes Matrix discovery and yielding reads
     local device, name = findMatrix()
     local cap = finite(device.getMaxEnergy(), "Kapazitaet")
     local energy = finite(device.getEnergy(), "Energie")
@@ -195,7 +206,7 @@ local function measure()
     return {energy = energy, cap = cap, input = avgInput, output = avgOutput,
         flowNet = avgInput - avgOutput, net = net,
         percent = energy / cap * 100, status = status, eta = eta,
-        color = color, name = name, elapsed = elapsed}
+        color = color, name = name, elapsed = elapsed, sampledAt = sampledAt}
 end
 
 local function colorCode(color)
@@ -410,6 +421,98 @@ local function display(frame, width, height)
     previousRows, previousWidth, previousHeight = frame.rows, width, height
 end
 
+local function navigation(f, width)
+    if not addonPresent then return end
+    local split = math.floor(width / 2)
+    local state = reactor and reactor.getView() or nil
+    local reactorLabel = state and state.mode == "FAULT" and "REAKTOR ! FAULT" or "REAKTOR > CONTROL"
+    for i, tab in ipairs({{"matrix", "MATRIX"}, {"reactor", reactorLabel}}) do
+        local x, span = i == 1 and 1 or split + 1, i == 1 and split or width - split
+        local bg = page == tab[1] and C.blue or C.gray
+        f.rect(x, 1, span, 1, bg)
+        local fg = i==2 and (addonError or (state and state.mode=="FAULT")) and C.red
+            or (page == tab[1] and C.cyan or C.lightGray)
+        f.center(1, tab[2], fg, bg, x, span)
+        hits[#hits + 1] = {x=x,y=1,w=span,h=1,page=tab[1]}
+    end
+end
+
+local function renderReactor(width, height)
+    if addonError or not reactor then
+        return renderMessage("Addon: " .. tostring(addonError or "nicht geladen"), width, height, "REAKTOR FEHLER")
+    end
+    local v, f = reactor.getView(), newFrame(width, height)
+    local spacious = width >= 38 and height >= 22
+    local color = v.mode == "FAULT" and C.red or (v.mode == "AUTO" and C.lime or C.orange)
+    local firstControlY = height - (spacious and 5 or 3)
+    local rowHeight = spacious and 2 or 1
+    local secondControlY = height - (spacious and 2 or 1)
+    local function line(y, text, fg)
+        if y > 1 and y < firstControlY then f.center(y, text, fg or C.lightGray) end
+    end
+    line(2, "FISSION / WASSER", C.cyan)
+    local status = "STATUS UNKLAR"
+    if not v.stopError and v.readings then
+        if v.readings.active == true then status = "REAKTOR AN"
+        elseif v.readings.active == false then status = "REAKTOR AUS" end
+    end
+    line(3, v.mode .. "  |  " .. status, color)
+    local r = v.readings
+    local rate = r and string.format("%.2f", r.actual) or "--"
+    local max = r and string.format("%.1f", r.max) or "--"
+    local pct = v.matrixPercent and string.format("%.1f%%", v.matrixPercent) or "--"
+    if spacious then
+        local cardWidth = math.floor((width - 5) / 2)
+        for i, card in ipairs({{"BRENNRATE / IST",rate .. " mB/t"},
+            {"FREIGEGEBEN / MAX",string.format("%.1f",v.ceiling) .. " mB/t"}}) do
+            local x = 2 + (i - 1) * (cardWidth + 2)
+            f.rect(x,5,cardWidth,3,C.gray)
+            f.center(5,card[1],C.lightGray,C.gray,x,cardWidth)
+            f.center(6,card[2],C.white,C.gray,x,cardWidth)
+        end
+        line(8, (width < 55 and "Struktur " or "Strukturmaximum ") .. max .. " mB/t  |  Matrix " .. pct)
+        if r then
+            line(10,string.format("TEMPERATUR %.0f K   |   SCHADEN %.0f%%",r.temperature,r.damage),r.temperature>=600 and C.orange or C.white)
+            local tanks = {{"WASSER",r.water,C.cyan},{"DAMPF",r.steam,C.orange},{"ABFALL",r.waste,C.red}}
+            local span = math.floor((width - 4) / 3)
+            for i,tank in ipairs(tanks) do
+                local x = 2+(i-1)*(span+1)
+                f.rect(x,11,span,3,C.gray)
+                f.center(11,tank[1],C.lightGray,C.gray,x,span)
+                f.center(12,string.format("%.0f%%",tank[2]*100),tank[3],C.gray,x,span)
+                f.rect(x,13,math.floor(span*tank[2]+0.5),1,tank[3])
+            end
+            line(14,string.format("Brennstoff %.0f%%  |  Kuehlung: WASSER",r.fuel*100))
+        else line(10,"Keine gueltigen Reaktor-/Matrix-Messwerte",C.red) end
+        local message = v.stopError or v.notice or v.reason or ""
+        local y = 15
+        while #message > 0 and y < firstControlY do
+            line(y,message:sub(1,width-2),v.stopError and C.red or color)
+            message=message:sub(width-1); y=y+1
+        end
+        if height>=27 then line(firstControlY-2,"95% STOP  /  80% WEITER  /  Neustart: PAUSE") end
+    else
+        line(4,rate .. " / " .. string.format("%.1f",v.ceiling) .. " mB/t",C.white)
+        line(5,r and string.format("%.0fK W%.0f%% D%.0f%%",r.temperature,r.water*100,r.steam*100) or "Messwerte fehlen",C.cyan)
+        line(6,v.stopError or v.notice or v.reason,color)
+    end
+    if width >= 12 and height >= 9 then
+        local span = math.floor(width / 3)
+        for i,a in ipairs(v.actions) do
+            local x = 1 + ((i-1)%3)*span
+            local w = i%3==0 and width-x+1 or span-1
+            local y = i<=3 and firstControlY or secondControlY
+            local bg = a.id=="scram" and C.red or (a.enabled and C.blue or C.gray)
+            f.rect(x,y,w,rowHeight,bg)
+            f.center(y,a.label,a.id=="scram" and C.black or (a.enabled and C.white or C.lightGray),bg,x,w)
+            if a.enabled then hits[#hits+1]={x=x,y=y,w=w,h=rowHeight,action=a.id} end
+        end
+    else
+        line(height,"Monitor vergroessern",C.orange)
+    end
+    return f
+end
+
 local function connectMonitor()
     local device = peripheral.wrap(CONFIG.monitor)
     if not device or type(device.blit) ~= "function" or type(device.setTextScale) ~= "function" then
@@ -438,22 +541,37 @@ local function connectMonitor()
 end
 
 local function refresh()
-    local okMonitor, ready = pcall(connectMonitor)
+    hits = {}
+    -- Protection precedes every monitor operation, including reconnect and draw.
+    local ok, data = protected(measure)
+    if terminating then return end
+    if not ok then history = {}; log(tostring(data)) end
+    if reactor then
+        local updated, err = protected(reactor.update, ok and data or nil, now())
+        if not updated then
+            addonError = "Steuerung fehlgeschlagen: " .. tostring(err)
+            protected(reactor.shutdown, addonError)
+        end
+    end
+    if terminating then return end
+    local okMonitor, ready = protected(connectMonitor)
+    if terminating then return end
     if not okMonitor or not ready then
-        history = {}
         if not okMonitor then log("Monitor nicht erreichbar: " .. tostring(ready)) end
         return
     end
     local width, height = monitor.getSize()
-    local ok, data = pcall(measure)
-    if ok then
-        display(renderData(data, width, height), width, height)
+    local frame
+    if page == "reactor" and addonPresent then
+        frame = renderReactor(width,height)
+    elseif ok then
+        frame = renderData(data,width,height)
         log("Matrix verbunden: " .. data.name .. ". Anzeige in " .. unit .. ". Stoppen: Ctrl+T.")
     else
-        history = {}
-        display(renderMessage(tostring(data), width, height), width, height)
-        log(tostring(data))
+        frame = renderMessage(tostring(data), width, height)
     end
+    navigation(frame,width)
+    display(frame,width,height)
 end
 
 local args = {...}
@@ -467,35 +585,95 @@ if args[1] == "--list" then
     return
 end
 
+-- loadfile uses the normal CC environment; location is independent of shell cwd.
+if CONFIG.reactorModule and fs and shell and shell.getRunningProgram then
+    local dir = fs.getDir(shell.getRunningProgram())
+    local path = fs.combine(dir, CONFIG.reactorModule)
+    if fs.exists(path) then
+        addonPresent = true
+        local loaded, result = protected(function()
+            local chunk, err = loadfile(path)
+            if not chunk then error(err,0) end
+            local module = chunk()
+            assert(type(module)=="table" and type(module.create)=="function", "Addon-Vertrag ungueltig")
+            local instance = module.create({dir=dir,clock=now,
+                onTerminate=function() terminating=true end})
+            for _,method in ipairs({"update","getView","action","shutdown"}) do
+                assert(type(instance[method])=="function", "Addon-Methode fehlt: "..method)
+            end
+            return instance
+        end)
+        if loaded then reactor = result else addonError = tostring(result); log("Addon: "..addonError) end
+    end
+end
+
 print("Induction Matrix Monitor - Monitor links / Matrix per Wired Modem")
 if unit == "J" and CONFIG.displayUnit == "FE" then
     print("FE-Helfer nicht verfuegbar: korrekte Rohwerte in Joule (J).")
 end
 
 local function safeRefresh()
-    local ok, err = pcall(refresh)
+    if terminating then return end
+    local ok, err = protected(refresh)
+    if terminating then return end
     if not ok then
+        hits = {}
         previousRows, history = nil, {}
         log("Anzeige nicht erreichbar; erneuter Versuch: " .. tostring(err))
     end
+    -- Peripheral methods yield and may consume a pending timer while waiting
+    -- for task_complete. Every refresh path must schedule its NEXT check only
+    -- after all yielding work, including touch/resize/reconnect/error paths.
+    if timer then os.cancelTimer(timer) end
+    timer = os.startTimer(CONFIG.refreshSeconds)
 end
 
-safeRefresh()
-timer = os.startTimer(CONFIG.refreshSeconds)
-while true do
-    local event, name = os.pullEventRaw()
-    if event == "terminate" then
+local function finalStop()
+        if timer then os.cancelTimer(timer) end
+        local shutdownOK, shutdownErr = true, nil
+        if reactor then shutdownOK, shutdownErr = protected(reactor.shutdown,"Ctrl+T") end
+        local stopNote = "Programm am Computer erneut starten."
+        if reactor then
+            local okView, v = protected(reactor.getView)
+            if not shutdownOK then stopNote = "STOP FEHLER: " .. tostring(shutdownErr)
+            elseif not okView then stopNote = "STOP unbestaetigt: Addon-Status fehlt"
+            elseif v.stopError then stopNote = v.stopError
+            else stopNote = "Reaktor gestoppt; NOT-AUS gespeichert. RESET nach Neustart." end
+        end
         if monitor then
-            pcall(function()
+            protected(function()
                 local w, h = monitor.getSize()
-                display(renderMessage("Programm am Computer erneut starten.", w, h, "GESTOPPT"), w, h)
+                display(renderMessage(stopNote, w, h, "GESTOPPT"), w, h)
             end)
         end
         print("Matrix-Monitor gestoppt.")
-        return
+        if reactor then print(stopNote) end
+end
+
+safeRefresh()
+while not terminating do
+    local event, name, x, y = os.pullEventRaw()
+    if event == "terminate" then
+        terminating = true
+    elseif event == "char" and addonPresent and (name == "m" or name == "r") then
+        page = name == "m" and "matrix" or "reactor"
+        previousRows = nil
+        safeRefresh()
+    elseif event == "monitor_touch" and name == CONFIG.monitor then
+        for _,hit in ipairs(hits) do
+            if x>=hit.x and x<hit.x+hit.w and y>=hit.y and y<hit.y+hit.h then
+                if hit.page then page=hit.page
+                elseif hit.action and reactor then
+                    local acted, err = protected(reactor.action,hit.action)
+                    if not acted then addonError=tostring(err); protected(reactor.shutdown,addonError) end
+                end
+                previousRows=nil
+                safeRefresh()
+                break
+            end
+        end
     elseif event == "timer" and name == timer then
         safeRefresh()
-        timer = os.startTimer(CONFIG.refreshSeconds)
     elseif event == "monitor_resize" and name == CONFIG.monitor then
         previousRows = nil
         safeRefresh()
@@ -505,3 +683,4 @@ while true do
         safeRefresh()
     end
 end
+finalStop()
