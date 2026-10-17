@@ -168,7 +168,11 @@ function M.create(context)
             if not finite(age) or age<0 or age>2 then reason="Befehl abgelaufen"
             elseif not fresh then reason="Messwerte veraltet"
             elseif latest.addonError~=nil or type(latest.reactor)~="table" then reason="Reaktor nicht verfuegbar"
-            elseif not reference or not finite(reference.at) or t<reference.at or t-reference.at>2 then reason="Angezeigte Messwerte veraltet"
+            -- The owner refreshes protection before processing. That read may
+            -- yield: validate the displayed source at receipt, independently
+            -- of the current-source and queued-command age checks above.
+            elseif not reference or not finite(reference.at) or command.received<reference.at
+                or command.received-reference.at>2 then reason="Angezeigte Messwerte veraltet"
             elseif command.seq>seq or command.controlEpoch~=epoch then reason="Bedienzustand geaendert"
             else
                 local enabled=false
