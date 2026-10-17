@@ -99,6 +99,7 @@ function M.create(context)
     local device, deviceName, readings, matrixPercent, sampledAt
     local stopError, persistenceError, expectedActive, initialized = nil, nil, false, false
     local lastRamp, resetRequested = 0, false
+    local resumeRate, resumeRequested = nil, false -- memory only, normal manual pause
     local function persist()
         local ok, err = protected(writeState, {version = 1, ceiling = ceiling, latch = latch})
         if not ok then
@@ -147,6 +148,7 @@ function M.create(context)
         return true
     end
     local function trip(message)
+        resumeRate, resumeRequested = nil, false
         mode, reason = "FAULT", tostring(message)
         if not latch then latch = reason; persist() end
         if persistenceError then reason = persistenceError end
@@ -226,7 +228,21 @@ function M.create(context)
                 else notice = "RESET gesperrt: kalt, sicher und gestoppt erforderlich" end
             end
             if mode == "FAULT" or latch then stop(); return end
-            if mode == "PAUSE" then
+            local resuming = mode == "PAUSE" and resumeRequested and resumeRate ~= nil
+            if mode == "PAUSE" and resumeRate and r.active then
+                error("Unerwarteter Start waehrend manueller Pause",0)
+            end
+            if resuming and (matrix.percent >= CONFIG.stopPercent or not healthyForStart(r,true)) then
+                -- A blocked manual request never becomes automatic standby or
+                -- a silently armed retry when battery/cooling later recovers.
+                resumeRequested = false
+                notice = matrix.percent >= CONFIG.stopPercent
+                    and "WEITER gesperrt: Matrix >=95% - spaeter erneut antippen"
+                    or "WEITER gesperrt: sichere Startwerte erforderlich - erneut antippen"
+                if not stop() then error(stopError,0) end
+                return
+            end
+            if mode == "PAUSE" and not resuming then
                 if not stop() then error(stopError,0) end
                 return
             end
@@ -247,16 +263,20 @@ function M.create(context)
                     return
                 end
                 if not persist() then error(persistenceError,0) end
-                freshness(matrix, started)
-                command("setBurnRate", math.min(CONFIG.startRate, limit))
-                -- The set call may yield: recheck age and live cap before activation.
+                local requestedRate = resuming and resumeRate or CONFIG.startRate
                 local liveCap = requireNumber(device.getMaxBurnRate(), 0.1, 1000000, "Strukturmaximum")
                 freshness(matrix, started)
-                if math.min(CONFIG.startRate, limit) > liveCap then error("Strukturmaximum waehrend Start geaendert", 0) end
+                local startRate = math.min(requestedRate, limit, liveCap)
+                command("setBurnRate", startRate)
+                -- The set call may yield: recheck age and live cap before activation.
+                liveCap = requireNumber(device.getMaxBurnRate(), 0.1, 1000000, "Strukturmaximum")
+                freshness(matrix, started)
+                if startRate > liveCap then error("Strukturmaximum waehrend Start geaendert", 0) end
                 command("activate")
                 if device.getStatus() ~= true then error("Start nicht bestaetigt", 0) end
                 r.active = true
                 expectedActive, lastRamp = true, clock()
+                resumeRate, resumeRequested = nil, false
                 mode, reason = "AUTO", "Regelt nach Matrix-Fuellstand"
                 return
             end
@@ -282,11 +302,36 @@ function M.create(context)
         notice = nil
         if id == "scram" then trip("Manueller NOT-AUS - RESET erforderlich")
         elseif id == "pause" then
+            -- Old queued PAUSE commands are stop-only, never a toggle and never
+            -- a second capture from an already stopped reactor.
+            if mode == "PAUSE" and resumeRate then return end
+            if mode == "AUTO" and expectedActive and not latch and not persistenceError then
+                local started = clock()
+                local captured, value = protected(function()
+                    if device.getStatus() ~= true then error("Externer Reaktorstopp vor PAUSE",0) end
+                    local value = requireNumber(device.getBurnRate(),0.1,1000000,"Pause-Brennrate")
+                    local t = clock()
+                    if not number(t,started,started+CONFIG.maxAgeSeconds) then error("Pause-Abfrage veraltet",0) end
+                    return value
+                end)
+                if not captured then trip("PAUSE-Aufnahme fehlgeschlagen: " .. tostring(value)); return end
+                if not stop() then trip(stopError); return end
+                resumeRate, resumeRequested = value, false
+                mode, reason = "PAUSE", string.format("Manuell pausiert - WEITER mit %.2f mB/t",value)
+                return
+            end
             if not latch and not persistenceError then mode, reason = "PAUSE", "Manuell pausiert" end
             if not stop() then trip(stopError) end
-        elseif id == "reset" then resetRequested = true
+        elseif id == "resume" then
+            if mode == "PAUSE" and resumeRate and not latch and not persistenceError and not stopError then
+                resumeRequested = true
+            end
+        elseif id == "reset" then
+            resumeRate, resumeRequested = nil, false
+            if mode == "PAUSE" then reason = "Pause - AUTO separat einschalten" end
+            resetRequested = true
         elseif id == "auto" then
-            if mode == "PAUSE" and not latch and not persistenceError then
+            if mode == "PAUSE" and not resumeRate and not latch and not persistenceError then
                 if persist() then mode, reason = "AUTO", "AUTO angefordert - pruefe frische Messwerte"
                 else trip(persistenceError) end
             end
@@ -301,11 +346,13 @@ function M.create(context)
     end
     function self.getView()
         local editable = mode == "PAUSE" and not latch and not persistenceError and readings ~= nil
+        local resumable = mode == "PAUSE" and resumeRate ~= nil and not latch and not persistenceError
         return {mode = mode, reason = reason, notice = notice, stopError = stopError,
             ceiling = ceiling, name = deviceName, readings = readings, matrixPercent = matrixPercent,
             actions = {
-                {id="auto",label="AUTO",enabled=mode=="PAUSE" and not latch and not persistenceError},
-                {id="pause",label="PAUSE",enabled=true}, {id="scram",label="NOT-AUS",enabled=true},
+                {id="auto",label="AUTO",enabled=mode=="PAUSE" and not resumeRate and not latch and not persistenceError},
+                {id=resumable and "resume" or "pause",label=resumable and "WEITER" or "PAUSE",enabled=true},
+                {id="scram",label="NOT-AUS",enabled=true},
                 {id="reset",label="RESET",enabled=mode=="FAULT" and not persistenceError},
                 {id="max_minus",label="MAX -",enabled=editable},
                 {id="max_plus",label="MAX +",enabled=editable and ceiling < readings.max},
