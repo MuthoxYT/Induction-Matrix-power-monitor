@@ -27,7 +27,7 @@ local CONFIG = {
     tripWaste = 0.80, resetWaste = 0.50,
     startRate = 0.1, rampStep = 0.1, rampSeconds = 2,
     fastRampStep = 0.5, fastRampSeconds = 1,
-    ceilingStep = 1, maxAgeSeconds = 2,
+    ceilingStep = 1, maxAgeSeconds = 2, recoveryChecks = 3,
 }
 
 local M = {id = "fission_water", title = "FISSION / WASSER"}
@@ -105,6 +105,8 @@ function M.create(context)
     local stopError, persistenceError, expectedActive, initialized = nil, nil, false, false
     local lastRamp, resetRequested = 0, false
     local resumeRate, resumeRequested = nil, false -- memory only, normal manual pause
+    local recoveryCount, recoveryAt, recoveryStandby = 0, nil, false
+    local delayedSample = {} -- private tag, never classify arbitrary API errors as transient
     -- Learned supply limit is memory only and survives normal PAUSE/STANDBY.
     local coolingLimit, previousWater, previousWaterAt, lastCoolingReduction
     local calibrationFast, fullIncreases, pendingIncrease = true, 0, nil
@@ -160,6 +162,7 @@ function M.create(context)
         return true
     end
     local function trip(message)
+        recoveryCount, recoveryAt, recoveryStandby = 0, nil, false
         resumeRate, resumeRequested = nil, false
         previousWater, previousWaterAt, pendingIncrease = nil, nil, nil
         calibrationFast, fullIncreases = false, 0
@@ -180,8 +183,12 @@ function M.create(context)
             or t - matrix.sampledAt > CONFIG.maxAgeSeconds then
             local matrixAge = matrix and number(matrix.sampledAt, 0, t) and t-matrix.sampledAt
             local reactorAge = number(t, started, math.huge-1) and t-started
-            error("Messwerte veraltet: Matrix " .. (matrixAge and string.format("%.2fs",matrixAge) or "ungueltig")
-                .. " / Reaktor " .. (reactorAge and string.format("%.2fs",reactorAge) or "ungueltig"), 0)
+            local message = "Messwerte veraltet: Matrix " .. (matrixAge and string.format("%.2fs",matrixAge) or "ungueltig")
+                .. " / Reaktor " .. (reactorAge and string.format("%.2fs",reactorAge) or "ungueltig")
+            if matrixAge and reactorAge and (matrixAge > CONFIG.maxAgeSeconds or reactorAge > CONFIG.maxAgeSeconds) then
+                error({tag=delayedSample,message=message},0)
+            end
+            error(message,0)
         end
         return t
     end
@@ -253,6 +260,7 @@ function M.create(context)
         if interrupted then trip("Programmabbruch: Terminated"); return end
         notice, readings, matrixPercent, sampledAt = nil, nil, nil, nil
         local started = clock()
+        local wasRecovering = mode == "MESSPAUSE"
         local success, err = protected(function()
             local found, name = find()
             if not compatible(found) then error("Reaktor-Schnittstelle unvollstaendig", 0) end
@@ -268,17 +276,27 @@ function M.create(context)
                 or not number(matrix.energy, 0, math.huge - 1)
                 or not number(matrix.cap, 0.000001, math.huge - 1)
                 or matrix.energy > matrix.cap then error("Matrix-Messwerte fehlen/ungueltig", 0) end
-            local t = freshness(matrix, started)
-            readings, matrixPercent, sampledAt = r, matrix.percent, t
+            -- A measured hazard always latches, even alongside an age overrun.
             if r.temperature >= CONFIG.tripTemperature then error("Temperatur zu hoch", 0) end
             if r.water <= CONFIG.tripWater then error("Wasserreserve <=50% - Kuehlung pruefen", 0) end
             if r.steam >= CONFIG.tripSteam then error("Dampfstau / Turbine pruefen", 0) end
             if r.waste >= CONFIG.tripWaste then error("Abfalltank zu voll", 0) end
             if r.damage > 0 then error("Reaktorschaden gemeldet", 0) end
             if r.forced then error("Reaktor zwangsdeaktiviert", 0) end
-            if r.fuel == 0 and (r.active or mode == "AUTO" or mode == "STANDBY") then
+            if r.fuel == 0 and (r.active or mode == "AUTO" or mode == "STANDBY" or mode == "MESSPAUSE") then
                 error("Kein Brennstoff", 0)
             end
+            if mode == "AUTO" and expectedActive and not r.active then
+                error("Externer/manueller Reaktorstopp - RESET erforderlich",0)
+            end
+            if mode == "MESSPAUSE" and r.active then
+                error("Unerwarteter Start waehrend Messpause",0)
+            end
+            if mode == "STANDBY" and r.active then
+                error("Externer Start im Standby",0)
+            end
+            local t = freshness(matrix, started)
+            readings, matrixPercent, sampledAt = r, matrix.percent, t
             if persistenceError then error(persistenceError, 0) end
             if resetRequested then
                 resetRequested = false
@@ -292,6 +310,25 @@ function M.create(context)
                 else notice = "RESET gesperrt: kalt, sicher und gestoppt erforderlich" end
             end
             if mode == "FAULT" or latch then stop(); return end
+            if mode == "MESSPAUSE" then
+                if not healthyForStart(r,true) then
+                    recoveryCount, recoveryAt = 0, nil
+                    reason = "Messpause: wartet auf sichere Startwerte"
+                    return
+                end
+                -- Confirm distinct, consecutive fresh observations, not UI clicks
+                -- at the same timestamp or observations separated by another gap.
+                if recoveryAt and t < recoveryAt then recoveryCount, recoveryAt = 0, nil end
+                if recoveryAt and t-recoveryAt > CONFIG.maxAgeSeconds then recoveryCount = 0 end
+                if not recoveryAt or t > recoveryAt then
+                    recoveryCount = recoveryCount + 1
+                    recoveryAt = t
+                end
+                reason = string.format("Messpause: frische Messungen %d/%d",recoveryCount,CONFIG.recoveryChecks)
+                if recoveryCount < CONFIG.recoveryChecks then return end
+                mode = recoveryStandby and "STANDBY" or "AUTO"
+                recoveryCount, recoveryAt, recoveryStandby = 0, nil, false
+            end
             local waterLimited = cooling(r, t)
             local resuming = mode == "PAUSE" and resumeRequested and resumeRate ~= nil
             if mode == "PAUSE" and resumeRate and r.active then
@@ -386,13 +423,30 @@ function M.create(context)
                 reason = "Kalibriert: " .. (calibrationFast and "SCHNELL" or "LANGSAM")
             end
         end)
-        if not success then resetRequested = false; trip(err) end
+        if not success then
+            resetRequested = false
+            if type(err)=="table" and err.tag==delayedSample then
+                if not latch and not persistenceError and ((mode=="AUTO" and expectedActive)
+                    or mode=="STANDBY" or mode=="MESSPAUSE" or wasRecovering) then
+                    recoveryStandby = recoveryStandby or mode=="STANDBY"
+                    recoveryCount, recoveryAt = 0, nil
+                    resumeRate, resumeRequested = nil, false
+                    previousWater, previousWaterAt, pendingIncrease = nil, nil, nil
+                    calibrationFast, fullIncreases = false, 0
+                    if stop() then
+                        mode, reason = "MESSPAUSE", "Messpause: warte auf 3 frische Messungen"
+                        notice = err.message
+                    else trip(stopError or "Messpause: STOP nicht bestaetigt") end
+                else trip(err.message) end
+            else trip(err) end
+        end
     end
     function self.action(id)
         if interrupted then trip("Programmabbruch: Terminated"); return end
         notice = nil
         if id == "scram" then trip("Manueller NOT-AUS - RESET erforderlich")
         elseif id == "pause" then
+            recoveryCount, recoveryAt, recoveryStandby = 0, nil, false
             -- Old queued PAUSE commands are stop-only, never a toggle and never
             -- a second capture from an already stopped reactor.
             if mode == "PAUSE" and resumeRate then return end
