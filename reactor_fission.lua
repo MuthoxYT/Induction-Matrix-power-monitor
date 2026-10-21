@@ -16,7 +16,7 @@ local CONFIG = {
     reactorName = nil,          -- nil = exactly one compatible reactor
     stateFile = "reactor_fission.state",
     defaultCeiling = 10,        -- approved water/turbine limit; NOT structural max
-    stopPercent = 95, resumePercent = 80,
+    stopPercent = 95, resumePercent = 80, taperPercent = 80,
     tripTemperature = 1000, resetTemperature = 600, -- Kelvin
     tripWater = 0.50, resetWater = 0.95,
     throttleWater = 0.90, coolingStepSeconds = 1,
@@ -383,7 +383,8 @@ function M.create(context)
                 return
             end
             if not expectedActive then error("Unerwartet aktiver Reaktor", 0) end
-            local fraction = math.max(0, math.min(1, (CONFIG.stopPercent - matrix.percent) / CONFIG.stopPercent))
+            local fraction = math.max(0, math.min(1, (CONFIG.stopPercent - matrix.percent)
+                / (CONFIG.stopPercent - CONFIG.taperPercent)))
             local batteryTarget = math.max(CONFIG.startRate, math.min(ceiling, r.max) * fraction * fraction)
             local step = calibrationFast and CONFIG.fastRampStep or CONFIG.rampStep
             local seconds = calibrationFast and CONFIG.fastRampSeconds or CONFIG.rampSeconds
@@ -412,13 +413,18 @@ function M.create(context)
                 lastRamp = clock()
             end
             mode, reason = "AUTO", "Regelt nach Matrix-Fuellstand"
-            if coolingLimit then
+            if not waterLimited and batteryTarget < math.min(ceiling,r.max)
+                and batteryTarget <= limit and nextRate >= batteryTarget - 0.001 then
+                reason = string.format("Akku begrenzt: %.2f mB/t",batteryTarget)
+            elseif coolingLimit then
                 local cap = math.min(coolingLimit, ceiling, r.max)
                 if not waterLimited then
                     reason = string.format("Kalibriert %s | Limit %.2f", calibrationFast and "SCHNELL" or "LANGSAM", cap)
                 else reason = string.format("Wasser begrenzt: %.2f mB/t", cap) end
             elseif waterLimited then
                 reason = "Wasser erholt sich - Leistung halten"
+            elseif nextRate >= math.min(ceiling,r.max) - 0.001 then
+                reason = string.format("Maximum erreicht: %.2f mB/t",math.min(ceiling,r.max))
             else
                 reason = "Kalibriert: " .. (calibrationFast and "SCHNELL" or "LANGSAM")
             end
